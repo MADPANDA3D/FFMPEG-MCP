@@ -11,5 +11,5 @@ if __name__ == "__main__":
         level=getattr(logging, settings.log_level.upper(), logging.INFO),
         format="%(asctime)s %(levelname)s %(message)s",
     )
-    worker = Worker([settings.queue_name], connection=get_redis())
+    worker = Worker(settings.queue_names(), connection=get_redis())
     worker.work()

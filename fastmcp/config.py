@@ -99,13 +99,95 @@ class Settings:
     )
     allowed_content_types: list[str] = field(
         default_factory=lambda: _split_csv(
-            _get_env("ALLOWED_CONTENT_TYPES", "video/*,audio/*,application/octet-stream")
+            _get_env(
+                "ALLOWED_CONTENT_TYPES",
+                "video/*,audio/*,image/*,application/octet-stream",
+            )
         )
     )
+    allow_image_ingest: bool = _get_bool("ALLOW_IMAGE_INGEST", True)
 
     ffmpeg_bin: str = _get_env("FFMPEG_BIN", "ffmpeg")
     ffprobe_bin: str = _get_env("FFPROBE_BIN", "ffprobe")
     ffmpeg_timeout_seconds: int = _get_int("FFMPEG_TIMEOUT_SECONDS", 900)
+    ffmpeg_text_timeout_seconds: int = _get_int("FFMPEG_TEXT_TIMEOUT_SECONDS", 0)
+    ffmpeg_logo_timeout_seconds: int = _get_int("FFMPEG_LOGO_TIMEOUT_SECONDS", 0)
+    ffmpeg_concat_timeout_seconds: int = _get_int("FFMPEG_CONCAT_TIMEOUT_SECONDS", 0)
+    ffmpeg_image_timeout_seconds: int = _get_int("FFMPEG_IMAGE_TIMEOUT_SECONDS", 0)
+    ffmpeg_slideshow_timeout_seconds: int = _get_int("FFMPEG_SLIDESHOW_TIMEOUT_SECONDS", 0)
+    ffmpeg_audio_timeout_seconds: int = _get_int("FFMPEG_AUDIO_TIMEOUT_SECONDS", 0)
+    ffmpeg_template_timeout_seconds: int = _get_int("FFMPEG_TEMPLATE_TIMEOUT_SECONDS", 0)
+    ffmpeg_workflow_timeout_seconds: int = _get_int("FFMPEG_WORKFLOW_TIMEOUT_SECONDS", 0)
+    ffmpeg_batch_timeout_seconds: int = _get_int("FFMPEG_BATCH_TIMEOUT_SECONDS", 0)
+
+    max_text_chars: int = _get_int("MAX_TEXT_CHARS", 200)
+    min_font_size: int = _get_int("MIN_FONT_SIZE", 16)
+    max_font_size: int = _get_int("MAX_FONT_SIZE", 160)
+    max_box_border_width: int = _get_int("MAX_BOX_BORDER_WIDTH", 80)
+    overlay_margin_px: int = _get_int("OVERLAY_MARGIN_PX", 32)
+
+    font_dirs: list[str] = field(
+        default_factory=lambda: _split_csv(
+            _get_env("FONT_DIRS", "/usr/share/fonts/truetype/dejavu")
+        )
+    )
+    font_allowlist: list[str] = field(
+        default_factory=lambda: _split_csv(_get_env("FONT_ALLOWLIST", ""))
+    )
+    font_default: str = _get_env(
+        "FONT_DEFAULT", "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+    )
+
+    logo_dir: str = _get_env("LOGO_DIR", "/data/logos")
+    logo_allowlist: list[str] = field(
+        default_factory=lambda: _split_csv(_get_env("LOGO_ALLOWLIST", ""))
+    )
+    logo_min_scale_pct: int = _get_int("LOGO_MIN_SCALE_PCT", 5)
+    logo_max_scale_pct: int = _get_int("LOGO_MAX_SCALE_PCT", 40)
+    logo_max_opacity: float = _get_float("LOGO_MAX_OPACITY", 1.0)
+
+    default_video_fps: int = _get_int("DEFAULT_VIDEO_FPS", 30)
+    default_image_duration_sec: float = _get_float("DEFAULT_IMAGE_DURATION_SEC", 3.0)
+    default_image_width: int = _get_int("DEFAULT_IMAGE_WIDTH", 1080)
+    default_image_height: int = _get_int("DEFAULT_IMAGE_HEIGHT", 1080)
+
+    max_concat_clips: int = _get_int("MAX_CONCAT_CLIPS", 20)
+    max_slideshow_images: int = _get_int("MAX_SLIDESHOW_IMAGES", 60)
+    max_audio_tracks: int = _get_int("MAX_AUDIO_TRACKS", 8)
+    max_template_layers: int = _get_int("MAX_TEMPLATE_LAYERS", 12)
+    max_template_text_layers: int = _get_int("MAX_TEMPLATE_TEXT_LAYERS", 6)
+    max_workflow_nodes: int = _get_int("MAX_WORKFLOW_NODES", 40)
+    max_batch_assets: int = _get_int("MAX_BATCH_ASSETS", 50)
+    max_batch_presets: int = _get_int("MAX_BATCH_PRESETS", 12)
+
+    social_presets: list[str] = field(
+        default_factory=lambda: _split_csv(
+            _get_env(
+                "SOCIAL_PRESETS",
+                "mp4_social_vertical_1080x1920,mp4_social_square_1080x1080,"
+                "mp4_social_portrait_1080x1350,mp4_youtube_1920x1080",
+            )
+        )
+    )
+
+    audio_norm_i: float = _get_float("AUDIO_NORM_I", -16.0)
+    audio_norm_lra: float = _get_float("AUDIO_NORM_LRA", 11.0)
+    audio_norm_tp: float = _get_float("AUDIO_NORM_TP", -1.5)
+    audio_sample_rate: int = _get_int("AUDIO_SAMPLE_RATE", 44100)
+    audio_min_silence_sec: float = _get_float("AUDIO_MIN_SILENCE_SEC", 0.5)
+    audio_silence_db: float = _get_float("AUDIO_SILENCE_DB", -50.0)
+    audio_fade_default_sec: float = _get_float("AUDIO_FADE_DEFAULT_SEC", 1.0)
+    ducking_ratio: float = _get_float("AUDIO_DUCKING_RATIO", 8.0)
+    ducking_threshold: float = _get_float("AUDIO_DUCKING_THRESHOLD", 0.02)
+    ducking_attack_ms: int = _get_int("AUDIO_DUCKING_ATTACK_MS", 20)
+    ducking_release_ms: int = _get_int("AUDIO_DUCKING_RELEASE_MS", 200)
+    ducking_music_gain: float = _get_float("AUDIO_DUCKING_MUSIC_GAIN", 0.8)
+
+    queue_name_urgent: str = _get_env("QUEUE_NAME_URGENT", "")
+    queue_name_batch: str = _get_env("QUEUE_NAME_BATCH", "")
+    queue_names_raw: list[str] = field(default_factory=lambda: _split_csv(_get_env("QUEUE_NAMES", "")))
+
+    log_structured: bool = _get_bool("MCP_LOG_STRUCTURED", False)
 
     discord_bot_token: str = _get_env("DISCORD_BOT_TOKEN", "")
     discord_api_base: str = _get_env("DISCORD_API_BASE", "https://discord.com/api/v10")
@@ -128,6 +210,43 @@ class Settings:
         if self.job_stale_seconds > 0:
             return self.job_stale_seconds
         return self.ffmpeg_timeout_seconds + 120
+
+    def text_timeout_seconds(self) -> int:
+        return self.ffmpeg_text_timeout_seconds or self.ffmpeg_timeout_seconds
+
+    def logo_timeout_seconds(self) -> int:
+        return self.ffmpeg_logo_timeout_seconds or self.ffmpeg_timeout_seconds
+
+    def concat_timeout_seconds(self) -> int:
+        return self.ffmpeg_concat_timeout_seconds or self.ffmpeg_timeout_seconds
+
+    def image_timeout_seconds(self) -> int:
+        return self.ffmpeg_image_timeout_seconds or self.ffmpeg_timeout_seconds
+
+    def slideshow_timeout_seconds(self) -> int:
+        return self.ffmpeg_slideshow_timeout_seconds or self.ffmpeg_timeout_seconds
+
+    def audio_timeout_seconds(self) -> int:
+        return self.ffmpeg_audio_timeout_seconds or self.ffmpeg_timeout_seconds
+
+    def template_timeout_seconds(self) -> int:
+        return self.ffmpeg_template_timeout_seconds or self.ffmpeg_timeout_seconds
+
+    def workflow_timeout_seconds(self) -> int:
+        return self.ffmpeg_workflow_timeout_seconds or self.ffmpeg_timeout_seconds
+
+    def batch_timeout_seconds(self) -> int:
+        return self.ffmpeg_batch_timeout_seconds or self.ffmpeg_timeout_seconds
+
+    def queue_names(self) -> list[str]:
+        names = list(self.queue_names_raw)
+        if not names:
+            names = [self.queue_name]
+        if self.queue_name_urgent and self.queue_name_urgent not in names:
+            names.append(self.queue_name_urgent)
+        if self.queue_name_batch and self.queue_name_batch not in names:
+            names.append(self.queue_name_batch)
+        return names
 
 
 settings = Settings()

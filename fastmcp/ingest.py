@@ -113,7 +113,11 @@ def _validate_magic(path: str) -> tuple[str, str]:
     if not kind:
         raise IngestError("Unable to detect file type")
     mime = kind.mime
-    if not (mime.startswith("video/") or mime.startswith("audio/")):
+    if not (
+        mime.startswith("video/")
+        or mime.startswith("audio/")
+        or (settings.allow_image_ingest and mime.startswith("image/"))
+    ):
         raise IngestError("Unsupported media type")
     return mime, kind.extension
 
@@ -198,7 +202,9 @@ async def _download_streaming(
                     if len(first_bytes) >= 2048:
                         kind = filetype.guess(first_bytes)
                         if kind and not (
-                            kind.mime.startswith("video/") or kind.mime.startswith("audio/")
+                            kind.mime.startswith("video/")
+                            or kind.mime.startswith("audio/")
+                            or (settings.allow_image_ingest and kind.mime.startswith("image/"))
                         ):
                             raise IngestError("Unsupported media type")
                         if kind or len(first_bytes) >= 65536:
@@ -252,7 +258,9 @@ async def _download_ranges(
                 if len(first_bytes) >= 2048:
                     kind = filetype.guess(first_bytes)
                     if kind and not (
-                        kind.mime.startswith("video/") or kind.mime.startswith("audio/")
+                        kind.mime.startswith("video/")
+                        or kind.mime.startswith("audio/")
+                        or (settings.allow_image_ingest and kind.mime.startswith("image/"))
                     ):
                         raise IngestError("Unsupported media type")
                     if kind or len(first_bytes) >= 65536:

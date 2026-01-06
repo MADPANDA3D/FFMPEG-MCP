@@ -8,6 +8,10 @@ download URLs. Built to match the Google/Discord MCP deployment style on VPS.
 - FastMCP HTTP server + async worker (RQ + Redis)
 - URL ingest with allowlist, magic-byte validation, size/duration caps
 - Preset-only FFmpeg operations (no arbitrary flags)
+- Marketing-focused presets (social crops, safe pads, audio normalization, text placeholders)
+- Text + logo overlays (drawtext + watermark) via async jobs
+- Templates + Brand Kits for one-call marketing outputs
+- Batch exports, campaign processing, and workflow chaining
 - Signed download URLs (`/download/{asset_id}`)
 - Optional exports to Drive and Discord
 - `ffmpeg_capabilities` self-description endpoint
@@ -28,6 +32,11 @@ Important defaults:
 - `STORAGE_BACKEND=local` (or `s3`)
 - `ALLOWED_DOMAINS=cdn.discordapp.com,media.discordapp.net,googleusercontent.com,...`
 - `MAX_INGEST_BYTES`, `MAX_OUTPUT_BYTES`, `MAX_DURATION_SECONDS`
+- `FONT_DIRS`, `FONT_DEFAULT` for text overlays
+- `LOGO_DIR` for logo overlays (`logo_key` values)
+- `ALLOW_IMAGE_INGEST=true` for image tools
+- `SOCIAL_PRESETS=...` for batch social exports
+- `QUEUE_NAME_URGENT`, `QUEUE_NAME_BATCH` for priority queues (optional)
 
 ### 2) Run the server
 
@@ -74,37 +83,220 @@ Single wrapper mode (for agents expecting a single tool):
 
 ## Tools (individual mode)
 
+Ingest + storage:
 - `media_ingest_from_url`
 - `media_ingest_from_drive`
 - `media_probe`
+- `media_get_download_url`
+- `media_export_to_drive`
+- `media_export_to_discord`
+
+Core video:
 - `ffmpeg_transcode`
 - `ffmpeg_thumbnail`
-- `ffmpeg_extract_audio`
 - `ffmpeg_trim`
+- `video_add_text`
+- `video_add_logo`
+- `video_concat`
+
+Image to video:
+- `image_to_video`
+- `images_to_slideshow`
+- `images_to_slideshow_ken_burns`
+
+Audio:
+- `ffmpeg_extract_audio`
+- `audio_normalize`
+- `audio_mix`
+- `audio_duck`
+- `audio_mix_with_background`
+- `audio_fade`
+- `audio_trim_silence`
+
+Templates + brand:
+- `template_list`
+- `template_describe`
+- `template_apply`
+- `brand_kit_upsert`
+- `brand_kit_get`
+- `brand_kit_list`
+- `brand_kit_delete`
+- `brand_kit_apply`
+
+Batch + workflow:
+- `batch_export_formats`
+- `batch_export_social_formats`
+- `campaign_process`
+- `workflow_run`
+
+Meta:
 - `ffmpeg_list_presets`
 - `ffmpeg_describe_preset`
 - `ffmpeg_capabilities`
 - `job_status`
-- `media_get_download_url`
-- `media_export_to_drive`
-- `media_export_to_discord`
 
 ## Presets
 
 Start with `ffmpeg_list_presets` or `ffmpeg_capabilities` for the full list.
 Use `ffmpeg_describe_preset(name)` for safe profile details.
 
-Default presets include:
+Sample presets:
 - `mp4_web_720p_small`
-- `mp4_web_1080p`
-- `mp4_web_480p_tiny`
-- `mp4_social_vertical_1080x1920`
-- `mp4_social_square_1080x1080`
-- `mp4_social_reel_1080x1920_high`
-- `mp3_voice_128k`
+- `mp4_social_vertical_1080x1920_safe_pad`
+- `mp4_social_portrait_1080x1350`
+- `mp4_youtube_1920x1080`
+- `mp4_social_vertical_1080x1920_lower_third`
+- `mp3_voice_128k_loudnorm`
 - `mp3_voice_64k`
 - `wav_pcm_16k_mono`
 - `gif_preview_lowfps`
+
+## Overlay tools
+
+Text overlay (`video_add_text`):
+- Required: `asset_id`, `text`
+- Optional: `position` (`top|center|bottom`), `font_size`, `font_color`,
+  `background_box`, `box_color`, `box_border_width`, `font_name`, `font_asset_id`
+
+Logo overlay (`video_add_logo`):
+- Required: `asset_id`, `logo_asset_id` or `logo_key`
+- Optional: `position` (`top-left|top-right|bottom-left|bottom-right`),
+  `scale_pct`, `opacity`
+
+Examples (router mode):
+
+```json
+{
+  "tool": "video_add_text",
+  "arguments": {
+    "asset_id": "ASSET_ID",
+    "text": "Summer Sale",
+    "position": "bottom",
+    "background_box": true,
+    "font_size": 56
+  }
+}
+```
+
+```json
+{
+  "tool": "video_add_logo",
+  "arguments": {
+    "asset_id": "ASSET_ID",
+    "logo_key": "brand.png",
+    "position": "bottom-right",
+    "scale_pct": 15,
+    "opacity": 0.9
+  }
+}
+```
+
+Notes:
+- `font_name` is resolved from `FONT_DIRS` (and `FONT_ALLOWLIST` if set).
+- `logo_key` is resolved from `LOGO_DIR` (and `LOGO_ALLOWLIST` if set).
+- Async tools accept optional `priority` (`urgent`, `batch`, or default) if queues are configured.
+
+## Templates
+
+List and apply:
+- `template_list`
+- `template_describe`
+- `template_apply`
+
+Example:
+
+```json
+{
+  "tool": "template_apply",
+  "arguments": {
+    "asset_id": "ASSET_ID",
+    "template_name": "promo_vertical_basic",
+    "variables": {
+      "headline": "Summer Sale",
+      "price": "$29",
+      "cta": "Shop Now"
+    },
+    "brand_kit_id": "acme"
+  }
+}
+```
+
+## Brand kits
+
+Create or update:
+
+```json
+{
+  "tool": "brand_kit_upsert",
+  "arguments": {
+    "brand_kit": {
+      "brand_kit_id": "acme",
+      "name": "Acme Co",
+      "logo_key": "acme.png",
+      "font_name": "DejaVuSans.ttf",
+      "font_color": "white",
+      "box_color": "black@0.6",
+      "auto_logo": true
+    }
+  }
+}
+```
+
+Apply:
+
+```json
+{
+  "tool": "brand_kit_apply",
+  "arguments": {
+    "asset_id": "ASSET_ID",
+    "brand_kit_id": "acme",
+    "text": "Acme Co"
+  }
+}
+```
+
+## Batch + workflows
+
+Batch exports:
+
+```json
+{
+  "tool": "batch_export_social_formats",
+  "arguments": {
+    "asset_id": "ASSET_ID"
+  }
+}
+```
+
+Campaign:
+
+```json
+{
+  "tool": "campaign_process",
+  "arguments": {
+    "asset_ids": ["A1", "A2"],
+    "template_name": "promo_vertical_basic",
+    "brand_kit_id": "acme"
+  }
+}
+```
+
+Workflow:
+
+```json
+{
+  "tool": "workflow_run",
+  "arguments": {
+    "workflow": {
+      "nodes": [
+        {"id": "base", "type": "transcode", "input": "ASSET_ID", "params": {"preset": "mp4_web_720p_small"}},
+        {"id": "logo", "type": "video_add_logo", "input": "base", "params": {"logo_key": "acme.png"}}
+      ],
+      "outputs": ["logo"]
+    }
+  }
+}
+```
 
 ## Example curl flow
 

@@ -13,6 +13,8 @@ JOB_PREFIX = "job:"
 ASSET_EXPIRY_SET = "asset:expiry"
 JOB_EXPIRY_SET = "job:expiry"
 CACHE_PREFIX = "cache:result:"
+BRAND_KIT_PREFIX = "brandkit:"
+BRAND_KIT_SET = "brandkit:all"
 
 
 _redis_client: redis.Redis | None = None
@@ -130,6 +132,33 @@ def set_cached_result(cache_key: str, payload: dict[str, Any], ttl_seconds: int)
 def delete_cached_result(cache_key: str) -> None:
     client = get_redis()
     client.delete(cache_key)
+
+
+def save_brand_kit(brand_kit: dict[str, Any]) -> None:
+    client = get_redis()
+    brand_kit_id = brand_kit["brand_kit_id"]
+    key = f"{BRAND_KIT_PREFIX}{brand_kit_id}"
+    client.set(key, json.dumps(brand_kit, ensure_ascii=True))
+    client.sadd(BRAND_KIT_SET, brand_kit_id)
+
+
+def get_brand_kit(brand_kit_id: str) -> dict[str, Any] | None:
+    client = get_redis()
+    raw = client.get(f"{BRAND_KIT_PREFIX}{brand_kit_id}")
+    if not raw:
+        return None
+    return json.loads(raw)
+
+
+def list_brand_kits() -> list[str]:
+    client = get_redis()
+    return list(client.smembers(BRAND_KIT_SET))
+
+
+def delete_brand_kit(brand_kit_id: str) -> None:
+    client = get_redis()
+    client.delete(f"{BRAND_KIT_PREFIX}{brand_kit_id}")
+    client.srem(BRAND_KIT_SET, brand_kit_id)
 
 
 def list_expired_assets(now_ts: int | None = None) -> list[str]:
