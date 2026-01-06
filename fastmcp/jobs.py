@@ -668,8 +668,6 @@ def transcode_job(
     finally:
         if cleanup and os.path.exists(input_path):
             os.remove(input_path)
-        if reference_cleanup and reference_path and os.path.exists(reference_path):
-            os.remove(reference_path)
         if os.path.exists(output_path):
             os.remove(output_path)
 
@@ -5481,10 +5479,6 @@ def render_iterate_job(
             )
             prev_settings = current_settings
 
-            if score is not None and score >= threshold:
-                best_result = iterations[-1]
-                break
-
             video_metrics = analysis.get("video", {}) if isinstance(analysis, dict) else {}
             audio_metrics = analysis.get("audio", {}) if isinstance(analysis, dict) else {}
             caption_metrics = analysis.get("captions", {}) if isinstance(analysis, dict) else {}
@@ -5514,6 +5508,10 @@ def render_iterate_job(
                 qa["recommended_fix"] = fatal_checks[0]["fix"]
                 analysis["qa"] = qa
                 iterations[-1]["analysis"] = analysis
+                best_result = iterations[-1]
+                break
+
+            if score is not None and score >= threshold:
                 best_result = iterations[-1]
                 break
 
@@ -5642,11 +5640,13 @@ def render_iterate_job(
         qa = None
         if best_result and isinstance(best_result.get("analysis"), dict):
             analysis_report = best_result.get("analysis", {})
-            qa = qa_from_report(
-                analysis_report,
-                rubric,
-                analysis_report.get("target_preset"),
-            )
+            qa = analysis_report.get("qa")
+            if not isinstance(qa, dict):
+                qa = qa_from_report(
+                    analysis_report,
+                    rubric,
+                    analysis_report.get("target_preset"),
+                )
 
         result_payload = {
             "rubric_name": rubric_name,
