@@ -71,7 +71,7 @@ from overlay_utils import (
     sanitize_text,
 )
 from presets import describe_preset, get_preset, list_presets
-from rubrics import describe_rubric, list_rubrics
+from rubrics import describe_rubric, get_rubric, list_rubrics, qa_from_report
 from templates import describe_template, list_templates
 from task_queue import get_queue
 from redis_store import (
@@ -300,6 +300,54 @@ def _last_log_line(logs: str | None) -> str | None:
     if not lines:
         return None
     return lines[-1]
+
+
+def _derive_qa(job_record: dict) -> dict:
+    qa = job_record.get("qa")
+    if isinstance(qa, dict):
+        return qa
+
+    report = job_record.get("report")
+    if isinstance(report, dict):
+        rubric_name = report.get("rubric", {}).get("name")
+        if rubric_name:
+            try:
+                rubric = get_rubric(rubric_name)
+            except ValueError:
+                rubric = None
+            if rubric:
+                return qa_from_report(report, rubric, report.get("target_preset"))
+
+    ranking = job_record.get("ranking")
+    if isinstance(ranking, list) and ranking:
+        top_report = ranking[0].get("report")
+        rubric_name = None
+        if isinstance(top_report, dict):
+            rubric_name = top_report.get("rubric", {}).get("name")
+        if rubric_name:
+            try:
+                rubric = get_rubric(rubric_name)
+            except ValueError:
+                rubric = None
+            if rubric:
+                return qa_from_report(top_report, rubric, top_report.get("target_preset"))
+
+    result = job_record.get("result")
+    if isinstance(result, dict):
+        best = result.get("best")
+        if isinstance(best, dict):
+            analysis = best.get("analysis")
+            if isinstance(analysis, dict):
+                rubric_name = analysis.get("rubric", {}).get("name")
+                if rubric_name:
+                    try:
+                        rubric = get_rubric(rubric_name)
+                    except ValueError:
+                        rubric = None
+                    if rubric:
+                        return qa_from_report(analysis, rubric, analysis.get("target_preset"))
+
+    return {"pass": None, "score": None, "failed_checks": [], "recommended_fix": None}
 
 
 def _build_cache_key(job_type: str, payload: dict) -> str:
@@ -834,6 +882,7 @@ async def tool_video_analyze(
     asset_id: str,
     rubric_name: str | None = None,
     target_preset: str | None = None,
+    reference_asset_id: str | None = None,
     captions_srt: str | None = None,
     captions_vtt: str | None = None,
     words_json: list[dict] | None = None,
@@ -860,6 +909,8 @@ async def tool_video_analyze(
         get_preset(target_preset)
     if rubric_name:
         describe_rubric(rubric_name)
+    if reference_asset_id and not get_asset(reference_asset_id):
+        raise ValueError("reference_asset_id not found")
 
     cache_key = _build_cache_key(
         "video_analyze",
@@ -867,6 +918,7 @@ async def tool_video_analyze(
             "asset_id": asset_id,
             "rubric_name": rubric_name,
             "target_preset": target_preset,
+            "reference_asset_id": reference_asset_id,
             "captions_srt": captions_srt,
             "captions_vtt": captions_vtt,
             "words_json": words_json,
@@ -885,12 +937,15 @@ async def tool_video_analyze(
     if cached_payload and cached_payload.get("report"):
         report = cached_payload.get("report")
         output_ids = cached_payload.get("output_asset_ids") or [asset_id]
+        extra = {"report": report}
+        if cached_payload.get("qa") or (isinstance(report, dict) and report.get("qa")):
+            extra["qa"] = cached_payload.get("qa") or report.get("qa")
         job_id = _record_cached_job(
             "video_analyze",
             asset_id,
             list(output_ids),
             cache_key,
-            extra={"report": report},
+            extra=extra,
         )
         return {"job_id": job_id, "cache_hit": True, "report": report}
     job_id = _enqueue_job(
@@ -900,6 +955,7 @@ async def tool_video_analyze(
             asset_id,
             rubric_name,
             target_preset,
+            reference_asset_id,
             captions_srt,
             captions_vtt,
             words_json,
@@ -952,12 +1008,15 @@ async def tool_asset_compare(
     if cached_payload and cached_payload.get("ranking"):
         ranking = cached_payload.get("ranking")
         output_ids = cached_payload.get("output_asset_ids") or []
+        extra = {"ranking": ranking}
+        if cached_payload.get("qa"):
+            extra["qa"] = cached_payload.get("qa")
         job_id = _record_cached_job(
             "asset_compare",
             asset_ids[0],
             list(output_ids),
             cache_key,
-            extra={"ranking": ranking},
+            extra=extra,
         )
         return {"job_id": job_id, "cache_hit": True, "ranking": ranking}
     job_id = _enqueue_job(
@@ -2297,6 +2356,10 @@ async def tool_render_iterate(
     trim_silence: bool | None = None,
     trim_silence_min_sec: float | None = None,
     trim_silence_threshold_db: float | None = None,
+    lock_framing: bool | None = None,
+    lock_captions: bool | None = None,
+    lock_audio: bool | None = None,
+    allow_trim_silence: bool | None = None,
     rubric_name: str | None = None,
     pass_threshold: float | None = None,
     max_iterations: int | None = None,
@@ -2390,6 +2453,10 @@ async def tool_render_iterate(
             "trim_silence": trim_silence,
             "trim_silence_min_sec": trim_silence_min_sec,
             "trim_silence_threshold_db": trim_silence_threshold_db,
+            "lock_framing": lock_framing,
+            "lock_captions": lock_captions,
+            "lock_audio": lock_audio,
+            "allow_trim_silence": allow_trim_silence,
             "rubric_name": rubric_name,
             "pass_threshold": pass_threshold,
             "max_iterations": max_iterations,
@@ -2399,12 +2466,15 @@ async def tool_render_iterate(
     if cached_payload and cached_payload.get("result"):
         result = cached_payload.get("result")
         output_ids = cached_payload.get("output_asset_ids") or []
+        extra = {"result": result}
+        if cached_payload.get("qa") or (isinstance(result, dict) and result.get("qa")):
+            extra["qa"] = cached_payload.get("qa") or result.get("qa")
         job_id = _record_cached_job(
             "render_iterate",
             primary_asset_id,
             list(output_ids),
             cache_key,
-            extra={"result": result},
+            extra=extra,
         )
         return {"job_id": job_id, "cache_hit": True, "result": result}
     job_id = _enqueue_job(
@@ -2456,6 +2526,10 @@ async def tool_render_iterate(
             trim_silence,
             trim_silence_min_sec,
             trim_silence_threshold_db,
+            lock_framing,
+            lock_captions,
+            lock_audio,
+            allow_trim_silence,
             rubric_name,
             pass_threshold,
             max_iterations,
@@ -2689,6 +2763,7 @@ async def tool_job_status(job_id: str) -> dict:
             "progress": None,
             "progress_pct": None,
             "output_asset_ids": None,
+            "qa": {"pass": None, "score": None, "failed_checks": [], "recommended_fix": None},
             "error": None,
             "logs_short": None,
             "last_log_line": None,
@@ -2706,6 +2781,7 @@ async def tool_job_status(job_id: str) -> dict:
         progress = 0 if status == "queued" else 50 if status == "running" else 100
     error = synced.get("error")
     logs_short = synced.get("logs_short")
+    qa = _derive_qa(synced)
     return {
         "status": status,
         "state": state,
@@ -2715,6 +2791,7 @@ async def tool_job_status(job_id: str) -> dict:
         "report": synced.get("report"),
         "ranking": synced.get("ranking"),
         "result": synced.get("result"),
+        "qa": qa,
         "error": error,
         "logs_short": logs_short,
         "last_log_line": _last_log_line(logs_short),

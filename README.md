@@ -235,13 +235,18 @@ Defaults:
 - Quality: `quality=draft|final` (draft uses 720p presets and optional watermark)
 
 Caption inputs: pass `captions_srt`, `captions_vtt`, or `words_json` to generate captioned outputs.
+Iteration constraints: `lock_framing`, `lock_captions`, `lock_audio`, `allow_trim_silence`.
 
 ## Analysis + QA
 
 - `video_analyze` returns audio/video/caption metrics with optional rubric scoring.
+- `video_analyze` accepts `reference_asset_id` to return deltas vs a golden reference.
 - `asset_compare` ranks assets by rubric score.
 - `rubric_list` / `rubric_describe` expose scoring profiles.
-- `job_status` includes `report` (analyze), `ranking` (compare), and `result` (iterate).
+- Rubrics include `social_reel_v1`, `testimonial_v1`, `insta_reel_v1`, `youtube_short_v1`.
+- `job_status` includes `qa` (pass/score/failed_checks/recommended_fix) plus
+  `report` (analyze), `ranking` (compare), and `result` (iterate).
+- `render_iterate` includes `iterations[].changes` for compact diffs.
 
 ## Templates
 

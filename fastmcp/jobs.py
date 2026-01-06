@@ -38,7 +38,7 @@ from overlay_utils import (
 )
 from templates import get_template, validate_template_variables
 from presets import draft_preset_for, get_preset, map_presets_for_quality
-from rubrics import get_rubric, score_report
+from rubrics import get_rubric, qa_from_report, score_report
 from redis_store import (
     build_cache_key,
     delete_cached_result,
@@ -637,6 +637,8 @@ def transcode_job(
     finally:
         if cleanup and os.path.exists(input_path):
             os.remove(input_path)
+        if reference_cleanup and reference_path and os.path.exists(reference_path):
+            os.remove(reference_path)
         if os.path.exists(output_path):
             os.remove(output_path)
 
@@ -2848,6 +2850,7 @@ def video_analyze_job(
     asset_id: str,
     rubric_name: str | None,
     target_preset: str | None,
+    reference_asset_id: str | None,
     captions_srt: str | None,
     captions_vtt: str | None,
     words_json: list[dict[str, Any]] | None,
@@ -2885,15 +2888,150 @@ def video_analyze_job(
 
     _ensure_temp_dir()
     input_path, cleanup = _resolve_input_path(asset)
+    reference_asset = None
+    reference_path = None
+    reference_cleanup = False
+    if reference_asset_id:
+        reference_asset = _get_asset_or_error(reference_asset_id)
+        _ensure_video_asset(reference_asset)
+        reference_path, reference_cleanup = _resolve_input_path(reference_asset)
     try:
-        probe = _probe_or_error(input_path)
-        duration = probe.get("duration_sec")
-        width = probe.get("width")
-        height = probe.get("height")
-        size_bytes = asset.get("size_bytes")
-        bitrate_kbps = None
-        if duration and size_bytes:
-            bitrate_kbps = round((float(size_bytes) * 8.0) / float(duration) / 1000.0, 2)
+        def collect_metrics(path: str, size_bytes: int | None, include_clipping: bool) -> dict[str, Any]:
+            probe = _probe_or_error(path)
+            duration = probe.get("duration_sec")
+            width = probe.get("width")
+            height = probe.get("height")
+            bitrate_kbps = None
+            if duration and size_bytes:
+                bitrate_kbps = round((float(size_bytes) * 8.0) / float(duration) / 1000.0, 2)
+
+            loudness_lufs = None
+            true_peak_db = None
+            lra = None
+            silence_pct = None
+            clipping_pct = None
+            if _has_audio_stream(probe):
+                try:
+                    loudnorm_logs = run_ffmpeg(
+                        [
+                            "-i",
+                            path,
+                            "-vn",
+                            "-af",
+                            f"loudnorm=I={settings.audio_norm_i}:TP={settings.audio_norm_tp}:"
+                            f"LRA={settings.audio_norm_lra}:print_format=json",
+                            "-f",
+                            "null",
+                            "-",
+                        ],
+                        timeout=settings.audio_timeout_seconds(),
+                    )
+                    payload = _parse_loudnorm_json(loudnorm_logs) or {}
+                    for key, fallback in [
+                        ("input_i", "measured_I"),
+                        ("input_tp", "measured_TP"),
+                        ("input_lra", "measured_LRA"),
+                    ]:
+                        if key in payload:
+                            value = payload.get(key)
+                        else:
+                            value = payload.get(fallback)
+                        try:
+                            value = float(value)
+                        except (TypeError, ValueError):
+                            value = None
+                        if key == "input_i":
+                            loudness_lufs = value
+                        elif key == "input_tp":
+                            true_peak_db = value
+                        elif key == "input_lra":
+                            lra = value
+                except FfmpegError:
+                    pass
+
+                try:
+                    silence_logs = run_ffmpeg(
+                        [
+                            "-i",
+                            path,
+                            "-vn",
+                            "-af",
+                            f"silencedetect=noise={settings.audio_silence_db}dB:"
+                            f"d={settings.audio_min_silence_sec}",
+                            "-f",
+                            "null",
+                            "-",
+                        ],
+                        timeout=settings.audio_timeout_seconds(),
+                    )
+                    silence_pct = _parse_silencedetect(silence_logs, duration)
+                except FfmpegError:
+                    pass
+
+                if include_clipping:
+                    try:
+                        clipping_logs = run_ffmpeg(
+                            [
+                                "-i",
+                                path,
+                                "-vn",
+                                "-af",
+                                "astats=metadata=1:reset=1",
+                                "-f",
+                                "null",
+                                "-",
+                            ],
+                            timeout=settings.audio_timeout_seconds(),
+                        )
+                        clipping_pct = _parse_astats_clipping(clipping_logs)
+                    except FfmpegError:
+                        pass
+
+            black_frames_pct = None
+            if _has_video_stream(probe):
+                try:
+                    black_logs = run_ffmpeg(
+                        [
+                            "-i",
+                            path,
+                            "-an",
+                            "-vf",
+                            "blackdetect=d=0.1:pic_th=0.98",
+                            "-f",
+                            "null",
+                            "-",
+                        ],
+                        timeout=settings.ffmpeg_timeout_seconds,
+                    )
+                    black_frames_pct = _parse_blackdetect(black_logs, duration)
+                except FfmpegError:
+                    pass
+
+            return {
+                "probe": probe,
+                "duration_sec": duration,
+                "width": width,
+                "height": height,
+                "bitrate_kbps": bitrate_kbps,
+                "audio": {
+                    "loudness_lufs": loudness_lufs,
+                    "true_peak_db": true_peak_db,
+                    "lra": lra,
+                    "silence_pct": silence_pct,
+                    "clipping_pct": clipping_pct,
+                },
+                "video": {
+                    "black_frames_pct": black_frames_pct,
+                },
+            }
+
+        include_clipping = bool(rubric and rubric.get("weights", {}).get("audio.clipping_pct", 0) > 0)
+        main_metrics = collect_metrics(input_path, asset.get("size_bytes"), include_clipping)
+        probe = main_metrics["probe"]
+        duration = main_metrics["duration_sec"]
+        width = main_metrics["width"]
+        height = main_metrics["height"]
+        bitrate_kbps = main_metrics["bitrate_kbps"]
 
         expected_w, expected_h = _expected_dims_from_preset(target_preset)
         resolution_ok = None
@@ -2906,6 +3044,7 @@ def video_analyze_job(
                 )
 
         file_size_ok = None
+        size_bytes = asset.get("size_bytes")
         if size_bytes:
             file_size_ok = int(size_bytes) <= settings.max_output_bytes
 
@@ -2913,108 +3052,14 @@ def video_analyze_job(
         if bitrate_kbps is not None and targets.get("bitrate_kbps_max") is not None:
             bitrate_ok = float(bitrate_kbps) <= float(targets["bitrate_kbps_max"])
 
-        loudness_lufs = None
-        true_peak_db = None
-        lra = None
-        silence_pct = None
-        clipping_pct = None
-
-        if _has_audio_stream(probe):
-            try:
-                loudnorm_logs = run_ffmpeg(
-                    [
-                        "-i",
-                        input_path,
-                        "-vn",
-                        "-af",
-                        f"loudnorm=I={settings.audio_norm_i}:TP={settings.audio_norm_tp}:"
-                        f"LRA={settings.audio_norm_lra}:print_format=json",
-                        "-f",
-                        "null",
-                        "-",
-                    ],
-                    timeout=settings.audio_timeout_seconds(),
-                )
-                payload = _parse_loudnorm_json(loudnorm_logs) or {}
-                for key, fallback in [
-                    ("input_i", "measured_I"),
-                    ("input_tp", "measured_TP"),
-                    ("input_lra", "measured_LRA"),
-                ]:
-                    if key in payload:
-                        value = payload.get(key)
-                    else:
-                        value = payload.get(fallback)
-                    try:
-                        value = float(value)
-                    except (TypeError, ValueError):
-                        value = None
-                    if key == "input_i":
-                        loudness_lufs = value
-                    elif key == "input_tp":
-                        true_peak_db = value
-                    elif key == "input_lra":
-                        lra = value
-            except FfmpegError:
-                pass
-
-            try:
-                silence_logs = run_ffmpeg(
-                    [
-                        "-i",
-                        input_path,
-                        "-vn",
-                        "-af",
-                        f"silencedetect=noise={settings.audio_silence_db}dB:"
-                        f"d={settings.audio_min_silence_sec}",
-                        "-f",
-                        "null",
-                        "-",
-                    ],
-                    timeout=settings.audio_timeout_seconds(),
-                )
-                silence_pct = _parse_silencedetect(silence_logs, duration)
-            except FfmpegError:
-                pass
-
-            if rubric and rubric.get("weights", {}).get("audio.clipping_pct", 0) > 0:
-                try:
-                    clipping_logs = run_ffmpeg(
-                        [
-                            "-i",
-                            input_path,
-                            "-vn",
-                            "-af",
-                            "astats=metadata=1:reset=1",
-                            "-f",
-                            "null",
-                            "-",
-                        ],
-                        timeout=settings.audio_timeout_seconds(),
-                    )
-                    clipping_pct = _parse_astats_clipping(clipping_logs)
-                except FfmpegError:
-                    pass
-
-        black_frames_pct = None
-        if _has_video_stream(probe):
-            try:
-                black_logs = run_ffmpeg(
-                    [
-                        "-i",
-                        input_path,
-                        "-an",
-                        "-vf",
-                        "blackdetect=d=0.1:pic_th=0.98",
-                        "-f",
-                        "null",
-                        "-",
-                    ],
-                    timeout=settings.ffmpeg_timeout_seconds,
-                )
-                black_frames_pct = _parse_blackdetect(black_logs, duration)
-            except FfmpegError:
-                pass
+        audio_metrics = main_metrics["audio"]
+        video_metrics = main_metrics["video"]
+        loudness_lufs = audio_metrics.get("loudness_lufs")
+        true_peak_db = audio_metrics.get("true_peak_db")
+        lra = audio_metrics.get("lra")
+        silence_pct = audio_metrics.get("silence_pct")
+        clipping_pct = audio_metrics.get("clipping_pct")
+        black_frames_pct = video_metrics.get("black_frames_pct")
 
         captions_metrics = {
             "caption_readability_score": None,
@@ -3109,9 +3154,69 @@ def video_analyze_job(
         }
 
         if rubric:
-            report["rubric"] = {"name": rubric_name, **score_report(report, rubric)}
+            report["rubric"] = {
+                "name": rubric_name,
+                **score_report(report, rubric, target_preset),
+            }
         if target_preset:
             report["target_preset"] = target_preset
+
+        reference_report = None
+        deltas: dict[str, Any] = {}
+        if reference_asset_id and reference_path and reference_asset:
+            reference_metrics = collect_metrics(
+                reference_path,
+                reference_asset.get("size_bytes"),
+                include_clipping,
+            )
+            reference_report = {
+                "asset_id": reference_asset_id,
+                "duration_sec": reference_metrics.get("duration_sec"),
+                "video": {
+                    "width": reference_metrics.get("width"),
+                    "height": reference_metrics.get("height"),
+                    "bitrate_kbps": reference_metrics.get("bitrate_kbps"),
+                    "black_frames_pct": reference_metrics.get("video", {}).get("black_frames_pct"),
+                },
+                "audio": reference_metrics.get("audio", {}),
+            }
+
+            ref_audio = reference_report.get("audio", {})
+            ref_video = reference_report.get("video", {})
+            if loudness_lufs is not None and ref_audio.get("loudness_lufs") is not None:
+                deltas["audio_loudness_lufs_delta"] = round(
+                    float(loudness_lufs) - float(ref_audio["loudness_lufs"]), 3
+                )
+            if true_peak_db is not None and ref_audio.get("true_peak_db") is not None:
+                deltas["audio_true_peak_db_delta"] = round(
+                    float(true_peak_db) - float(ref_audio["true_peak_db"]), 3
+                )
+            if lra is not None and ref_audio.get("lra") is not None:
+                deltas["audio_lra_delta"] = round(float(lra) - float(ref_audio["lra"]), 3)
+            if silence_pct is not None and ref_audio.get("silence_pct") is not None:
+                deltas["audio_silence_pct_delta"] = round(
+                    float(silence_pct) - float(ref_audio["silence_pct"]), 3
+                )
+            if black_frames_pct is not None and ref_video.get("black_frames_pct") is not None:
+                deltas["black_frames_pct_delta"] = round(
+                    float(black_frames_pct) - float(ref_video["black_frames_pct"]), 3
+                )
+            if duration and reference_report.get("duration_sec"):
+                deltas["duration_delta_sec"] = round(
+                    float(duration) - float(reference_report["duration_sec"]), 3
+                )
+            if bitrate_kbps is not None and ref_video.get("bitrate_kbps") is not None:
+                deltas["bitrate_kbps_delta"] = round(
+                    float(bitrate_kbps) - float(ref_video["bitrate_kbps"]), 3
+                )
+
+        if reference_report:
+            report["reference"] = reference_report
+        if deltas:
+            report["reference_deltas"] = deltas
+
+        if rubric:
+            report["qa"] = qa_from_report(report, rubric, target_preset)
 
         _finish_job(
             job_id,
@@ -3119,6 +3224,7 @@ def video_analyze_job(
             {
                 "output_asset_ids": [asset_id],
                 "report": report,
+                "qa": report.get("qa"),
                 "logs_short": "analysis complete",
                 "finished_at": utc_now_iso(),
             },
@@ -3132,6 +3238,7 @@ def video_analyze_job(
                     "created_at": utc_now_iso(),
                     "job_type": "video_analyze",
                     "report": report,
+                    "qa": report.get("qa"),
                 },
                 settings.asset_ttl_seconds(),
             )
@@ -3191,6 +3298,7 @@ def asset_compare_job(
                 None,
                 None,
                 None,
+                None,
                 cache_key=None,
                 job_id_override="",
             )
@@ -3219,12 +3327,19 @@ def asset_compare_job(
             key=lambda item: (item.get("score") is not None, item.get("score", 0)),
             reverse=True,
         )
+        qa = None
+        if ranked:
+            rubric = get_rubric(rubric_name)
+            top_report = ranked[0].get("report")
+            if isinstance(top_report, dict):
+                qa = qa_from_report(top_report, rubric, target_preset)
         _finish_job(
             job_id,
             "success",
             {
                 "output_asset_ids": [item["asset_id"] for item in ranked],
                 "ranking": ranked,
+                "qa": qa,
                 "logs_short": "compare complete",
                 "finished_at": utc_now_iso(),
             },
@@ -3238,10 +3353,11 @@ def asset_compare_job(
                     "created_at": utc_now_iso(),
                     "job_type": "asset_compare",
                     "ranking": ranked,
+                    "qa": qa,
                 },
                 settings.asset_ttl_seconds(),
             )
-        return {"ranking": ranked}
+        return {"ranking": ranked, "qa": qa}
     except (FfmpegError, JobError, ValueError) as exc:
         _finish_job(
             job_id,
@@ -4955,6 +5071,10 @@ def render_iterate_job(
     trim_silence: bool | None,
     trim_silence_min_sec: float | None,
     trim_silence_threshold_db: float | None,
+    lock_framing: bool | None,
+    lock_captions: bool | None,
+    lock_audio: bool | None,
+    allow_trim_silence: bool | None,
     rubric_name: str | None,
     pass_threshold: float | None,
     max_iterations: int | None,
@@ -5027,6 +5147,11 @@ def render_iterate_job(
             else settings.audio_silence_db
         )
 
+        lock_framing = bool(lock_framing) if lock_framing is not None else False
+        lock_captions = bool(lock_captions) if lock_captions is not None else False
+        lock_audio = bool(lock_audio) if lock_audio is not None else False
+        allow_trim_silence = True if allow_trim_silence is None else bool(allow_trim_silence)
+
         rubric_name = rubric_name or _default_rubric_name(render_type)
         rubric = get_rubric(rubric_name)
         threshold = float(pass_threshold) if pass_threshold is not None else float(rubric.get("pass_threshold", 85))
@@ -5038,6 +5163,7 @@ def render_iterate_job(
 
         iterations: list[dict[str, Any]] = []
         best_result: dict[str, Any] | None = None
+        prev_settings: dict[str, Any] | None = None
 
         for idx in range(max_iterations):
             variables = {}
@@ -5047,6 +5173,29 @@ def render_iterate_job(
                 variables = {"quote": quote, "author": author}
             elif render_type == "offer_card":
                 variables = {"headline": headline, "price": price, "cta": cta}
+
+            current_settings = {
+                "framing_mode": framing_mode,
+                "caption_max_chars": caption_max_chars,
+                "caption_max_lines": caption_max_lines,
+                "caption_max_words": caption_max_words,
+                "caption_font_size": caption_font_size,
+                "caption_safe_zone_bottom_px": caption_safe_zone_bottom_px,
+                "caption_safe_zone_top_px": caption_safe_zone_top_px,
+                "audio_target_lufs": audio_target_lufs,
+                "audio_true_peak": audio_true_peak,
+                "ducking_ratio": ducking_ratio,
+                "music_gain": music_gain,
+                "trim_silence": trim_silence,
+                "trim_silence_min_sec": trim_silence_min_sec,
+                "trim_silence_threshold_db": trim_silence_threshold_db,
+            }
+            changes: list[str] = []
+            if prev_settings:
+                for key, value in current_settings.items():
+                    prev_value = prev_settings.get(key)
+                    if value != prev_value:
+                        changes.append(f"{key} {prev_value} -> {value}")
 
             render_result = _render_marketing_job(
                 job_type=f"render_iterate:{render_type}",
@@ -5113,6 +5262,7 @@ def render_iterate_job(
                 eval_asset_id,
                 rubric_name,
                 target_preset,
+                None,
                 captions_srt,
                 captions_vtt,
                 words_json,
@@ -5137,6 +5287,7 @@ def render_iterate_job(
                     "score": score,
                     "outputs": outputs,
                     "analysis": analysis,
+                    "changes": changes,
                     "settings": {
                         "framing_mode": framing_mode,
                         "caption_max_chars": caption_max_chars,
@@ -5144,14 +5295,18 @@ def render_iterate_job(
                         "caption_max_words": caption_max_words,
                         "caption_font_size": caption_font_size,
                         "caption_safe_zone_bottom_px": caption_safe_zone_bottom_px,
+                        "caption_safe_zone_top_px": caption_safe_zone_top_px,
                         "audio_target_lufs": audio_target_lufs,
                         "audio_true_peak": audio_true_peak,
                         "ducking_ratio": ducking_ratio,
                         "music_gain": music_gain,
                         "trim_silence": trim_silence,
+                        "trim_silence_min_sec": trim_silence_min_sec,
+                        "trim_silence_threshold_db": trim_silence_threshold_db,
                     },
                 }
             )
+            prev_settings = current_settings
 
             if score is not None and score >= threshold:
                 best_result = iterations[-1]
@@ -5165,25 +5320,26 @@ def render_iterate_job(
                 video_metrics.get("black_frames_pct") is not None
                 and video_metrics.get("black_frames_pct") > targets.get("black_frames_pct_max", 1.0)
                 and framing_mode == "safe_pad"
+                and not lock_framing
             ):
                 framing_mode = "crop"
 
-            if caption_metrics.get("safe_zone_violations"):
+            if caption_metrics.get("safe_zone_violations") and not lock_captions:
                 caption_safe_zone_bottom_px = int(caption_safe_zone_bottom_px or settings.caption_safe_zone_bottom_px) + 16
 
             readability = caption_metrics.get("caption_readability_score")
-            if readability is not None and readability < targets.get("caption_readability_min", 70.0):
+            if readability is not None and readability < targets.get("caption_readability_min", 70.0) and not lock_captions:
                 caption_max_chars = max(40, int(caption_max_chars) - 6)
                 caption_max_words = max(6, int(caption_max_words) - 1)
                 caption_max_lines = min(3, int(caption_max_lines) + 1)
                 caption_font_size = max(settings.min_font_size, int(caption_font_size) - 2)
 
             speed_wpm = caption_metrics.get("caption_speed_wpm")
-            if speed_wpm and speed_wpm > targets.get("caption_speed_wpm_max", 180.0):
+            if speed_wpm and speed_wpm > targets.get("caption_speed_wpm_max", 180.0) and not lock_captions:
                 caption_max_words = max(5, int(caption_max_words) - 1)
 
             loudness = audio_metrics.get("loudness_lufs")
-            if loudness is not None:
+            if loudness is not None and not lock_audio:
                 target_lufs = float(targets.get("loudness_lufs", -16.0))
                 tolerance = float(targets.get("loudness_tolerance", 2.5))
                 if loudness < target_lufs - tolerance:
@@ -5192,12 +5348,18 @@ def render_iterate_job(
                     audio_target_lufs = max(-23.0, float(audio_target_lufs) - 1.0)
 
             true_peak = audio_metrics.get("true_peak_db")
-            if true_peak is not None and true_peak > targets.get("true_peak_max_db", -1.5):
+            if true_peak is not None and true_peak > targets.get("true_peak_max_db", -1.5) and not lock_audio:
                 audio_true_peak = min(float(audio_true_peak), targets.get("true_peak_max_db", -1.5))
                 music_gain = max(0.4, float(music_gain) - 0.05)
 
             silence_pct = audio_metrics.get("silence_pct")
-            if silence_pct is not None and silence_pct > targets.get("silence_pct_max", 5.0) and voice_asset_id:
+            if (
+                silence_pct is not None
+                and silence_pct > targets.get("silence_pct_max", 5.0)
+                and voice_asset_id
+                and not lock_audio
+                and allow_trim_silence
+            ):
                 trim_silence = True
                 trim_silence_min_sec = max(0.2, float(trim_silence_min_sec) - 0.1)
                 trim_silence_threshold_db = min(-20.0, float(trim_silence_threshold_db) + 2.0)
@@ -5213,11 +5375,21 @@ def render_iterate_job(
         if best_result is None and iterations:
             best_result = max(iterations, key=lambda item: item.get("score") or 0)
 
+        qa = None
+        if best_result and isinstance(best_result.get("analysis"), dict):
+            analysis_report = best_result.get("analysis", {})
+            qa = qa_from_report(
+                analysis_report,
+                rubric,
+                analysis_report.get("target_preset"),
+            )
+
         result_payload = {
             "rubric_name": rubric_name,
             "pass_threshold": threshold,
             "iterations": iterations,
             "best": best_result,
+            "qa": qa,
         }
         _finish_job(
             job_id,
@@ -5225,6 +5397,7 @@ def render_iterate_job(
             {
                 "output_asset_ids": [best_result.get("analysis", {}).get("asset_id")] if best_result else [],
                 "result": result_payload,
+                "qa": qa,
                 "logs_short": "iteration complete",
                 "finished_at": utc_now_iso(),
             },
@@ -5238,6 +5411,7 @@ def render_iterate_job(
                     "created_at": utc_now_iso(),
                     "job_type": "render_iterate",
                     "result": result_payload,
+                    "qa": qa,
                 },
                 settings.asset_ttl_seconds(),
             )
