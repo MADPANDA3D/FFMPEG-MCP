@@ -9,7 +9,7 @@ from typing import Any
 
 from rq import get_current_job
 
-from captions import parse_captions_input
+from captions import parse_captions_input, resolve_safe_zone_profile
 from config import settings
 from ffmpeg_utils import FfmpegError, run_ffmpeg
 from ffprobe_utils import run_ffprobe
@@ -1075,6 +1075,7 @@ def captions_burn_in_job(
     max_chars: int | None,
     max_lines: int | None,
     max_words: int | None,
+    safe_zone_profile: str | None,
     safe_zone_bottom_px: int | None,
     safe_zone_top_px: int | None,
     font_name: str | None,
@@ -1171,11 +1172,12 @@ def captions_burn_in_job(
     if resolved_padding < 0:
         raise JobError("caption_padding_px must be >= 0")
 
+    profile_bottom, profile_top = resolve_safe_zone_profile(safe_zone_profile)
     resolved_safe_bottom = safe_zone_bottom_px if safe_zone_bottom_px is not None else (
-        brand_kit.get("caption_safe_zone_bottom_px") if brand_kit else None
+        profile_bottom if profile_bottom is not None else (brand_kit.get("caption_safe_zone_bottom_px") if brand_kit else None)
     )
     resolved_safe_top = safe_zone_top_px if safe_zone_top_px is not None else (
-        brand_kit.get("caption_safe_zone_top_px") if brand_kit else None
+        profile_top if profile_top is not None else (brand_kit.get("caption_safe_zone_top_px") if brand_kit else None)
     )
     resolved_safe_bottom = int(resolved_safe_bottom or settings.caption_safe_zone_bottom_px)
     resolved_safe_top = int(resolved_safe_top or settings.caption_safe_zone_top_px)
@@ -2863,6 +2865,7 @@ def video_analyze_job(
     max_words: int | None,
     safe_zone_bottom_px: int | None,
     safe_zone_top_px: int | None,
+    safe_zone_profile: str | None,
     cache_key: str | None = None,
     job_id_override: str | None = None,
 ) -> dict[str, Any]:
@@ -2905,12 +2908,15 @@ def video_analyze_job(
             if duration and size_bytes:
                 bitrate_kbps = round((float(size_bytes) * 8.0) / float(duration) / 1000.0, 2)
 
+            has_audio = _has_audio_stream(probe)
+            has_video = _has_video_stream(probe)
+
             loudness_lufs = None
             true_peak_db = None
             lra = None
             silence_pct = None
             clipping_pct = None
-            if _has_audio_stream(probe):
+            if has_audio:
                 try:
                     loudnorm_logs = run_ffmpeg(
                         [
@@ -2988,7 +2994,7 @@ def video_analyze_job(
                         pass
 
             black_frames_pct = None
-            if _has_video_stream(probe):
+            if has_video:
                 try:
                     black_logs = run_ffmpeg(
                         [
@@ -3014,6 +3020,7 @@ def video_analyze_job(
                 "height": height,
                 "bitrate_kbps": bitrate_kbps,
                 "audio": {
+                    "has_audio": has_audio,
                     "loudness_lufs": loudness_lufs,
                     "true_peak_db": true_peak_db,
                     "lra": lra,
@@ -3021,6 +3028,7 @@ def video_analyze_job(
                     "clipping_pct": clipping_pct,
                 },
                 "video": {
+                    "has_video": has_video,
                     "black_frames_pct": black_frames_pct,
                 },
             }
@@ -3061,11 +3069,22 @@ def video_analyze_job(
         clipping_pct = audio_metrics.get("clipping_pct")
         black_frames_pct = video_metrics.get("black_frames_pct")
 
+        resolved_max_chars = None
+        resolved_max_lines = None
+        resolved_max_words = None
+        resolved_position = None
+        resolved_padding = None
+        resolved_safe_bottom = None
+        resolved_safe_top = None
+        resolved_font_size = None
+
         captions_metrics = {
             "caption_readability_score": None,
             "caption_speed_score": None,
             "caption_speed_wpm": None,
             "safe_zone_violations": None,
+            "segment_count": None,
+            "empty": None,
         }
         if captions_srt or captions_vtt or words_json:
             resolved_max_chars = max_chars if max_chars is not None else (
@@ -3093,11 +3112,12 @@ def video_analyze_job(
             )
             resolved_padding = int(resolved_padding or settings.caption_padding_px)
 
+            profile_bottom, profile_top = resolve_safe_zone_profile(safe_zone_profile)
             resolved_safe_bottom = safe_zone_bottom_px if safe_zone_bottom_px is not None else (
-                brand_kit.get("caption_safe_zone_bottom_px") if brand_kit else None
+                profile_bottom if profile_bottom is not None else (brand_kit.get("caption_safe_zone_bottom_px") if brand_kit else None)
             )
             resolved_safe_top = safe_zone_top_px if safe_zone_top_px is not None else (
-                brand_kit.get("caption_safe_zone_top_px") if brand_kit else None
+                profile_top if profile_top is not None else (brand_kit.get("caption_safe_zone_top_px") if brand_kit else None)
             )
             resolved_safe_bottom = int(resolved_safe_bottom or settings.caption_safe_zone_bottom_px)
             resolved_safe_top = int(resolved_safe_top or settings.caption_safe_zone_top_px)
@@ -3116,6 +3136,8 @@ def video_analyze_job(
                 resolved_max_words,
                 None,
             )
+            captions_metrics["segment_count"] = len(segments)
+            captions_metrics["empty"] = len(segments) == 0
             speed_target = float(targets.get("caption_speed_wpm_max", 180.0))
             captions_metrics = _caption_metrics(
                 segments,
@@ -3129,6 +3151,26 @@ def video_analyze_job(
                 resolved_font_size,
                 speed_target,
             )
+            captions_metrics["segment_count"] = len(segments)
+            captions_metrics["empty"] = len(segments) == 0
+            if safe_zone_profile:
+                captions_metrics["safe_zone_profile"] = safe_zone_profile
+
+        qa_overrides: dict[str, Any] = {"target_preset": target_preset}
+        if captions_srt or captions_vtt or words_json:
+            qa_overrides.update(
+                {
+                    "caption_position": resolved_position,
+                    "caption_font_size": resolved_font_size,
+                    "caption_padding_px": resolved_padding,
+                    "caption_max_chars": resolved_max_chars,
+                    "caption_max_lines": resolved_max_lines,
+                    "caption_max_words": resolved_max_words,
+                    "caption_safe_zone_profile": safe_zone_profile,
+                    "caption_safe_zone_bottom_px": resolved_safe_bottom,
+                    "caption_safe_zone_top_px": resolved_safe_top,
+                }
+            )
 
         report = {
             "asset_id": asset_id,
@@ -3138,12 +3180,14 @@ def video_analyze_job(
                 "height": height,
                 "bitrate_kbps": bitrate_kbps,
                 "file_size_bytes": size_bytes,
+                "has_video": video_metrics.get("has_video"),
                 "resolution_ok": resolution_ok,
                 "bitrate_ok": bitrate_ok,
                 "file_size_ok": file_size_ok,
                 "black_frames_pct": black_frames_pct,
             },
             "audio": {
+                "has_audio": audio_metrics.get("has_audio"),
                 "loudness_lufs": loudness_lufs,
                 "true_peak_db": true_peak_db,
                 "lra": lra,
@@ -3176,6 +3220,7 @@ def video_analyze_job(
                     "width": reference_metrics.get("width"),
                     "height": reference_metrics.get("height"),
                     "bitrate_kbps": reference_metrics.get("bitrate_kbps"),
+                    "has_video": reference_metrics.get("video", {}).get("has_video"),
                     "black_frames_pct": reference_metrics.get("video", {}).get("black_frames_pct"),
                 },
                 "audio": reference_metrics.get("audio", {}),
@@ -3216,7 +3261,7 @@ def video_analyze_job(
             report["reference_deltas"] = deltas
 
         if rubric:
-            report["qa"] = qa_from_report(report, rubric, target_preset)
+            report["qa"] = qa_from_report(report, rubric, target_preset, qa_overrides)
 
         _finish_job(
             job_id,
@@ -3299,6 +3344,7 @@ def asset_compare_job(
                 None,
                 None,
                 None,
+                None,
                 cache_key=None,
                 job_id_override="",
             )
@@ -3329,10 +3375,13 @@ def asset_compare_job(
         )
         qa = None
         if ranked:
-            rubric = get_rubric(rubric_name)
             top_report = ranked[0].get("report")
-            if isinstance(top_report, dict):
-                qa = qa_from_report(top_report, rubric, target_preset)
+            if isinstance(top_report, dict) and isinstance(top_report.get("qa"), dict):
+                qa = top_report.get("qa")
+            else:
+                rubric = get_rubric(rubric_name)
+                if isinstance(top_report, dict):
+                    qa = qa_from_report(top_report, rubric, target_preset)
         _finish_job(
             job_id,
             "success",
@@ -4284,6 +4333,7 @@ def _render_marketing_job(
     caption_max_chars: int | None,
     caption_max_lines: int | None,
     caption_max_words: int | None,
+    caption_safe_zone_profile: str | None,
     caption_safe_zone_bottom_px: int | None,
     caption_safe_zone_top_px: int | None,
     caption_font_name: str | None,
@@ -4646,6 +4696,7 @@ def _render_marketing_job(
                         "max_chars": caption_max_chars,
                         "max_lines": caption_max_lines,
                         "max_words": caption_max_words,
+                        "safe_zone_profile": caption_safe_zone_profile,
                         "safe_zone_bottom_px": caption_safe_zone_bottom_px,
                         "safe_zone_top_px": caption_safe_zone_top_px,
                         "font_name": caption_font_name,
@@ -4673,6 +4724,7 @@ def _render_marketing_job(
                         caption_max_chars,
                         caption_max_lines,
                         caption_max_words,
+                        caption_safe_zone_profile,
                         caption_safe_zone_bottom_px,
                         caption_safe_zone_top_px,
                         caption_font_name,
@@ -4755,6 +4807,7 @@ def render_social_ad_job(
     caption_max_chars: int | None,
     caption_max_lines: int | None,
     caption_max_words: int | None,
+    caption_safe_zone_profile: str | None,
     caption_safe_zone_bottom_px: int | None,
     caption_safe_zone_top_px: int | None,
     caption_font_name: str | None,
@@ -4806,6 +4859,7 @@ def render_social_ad_job(
         caption_max_chars=caption_max_chars,
         caption_max_lines=caption_max_lines,
         caption_max_words=caption_max_words,
+        caption_safe_zone_profile=caption_safe_zone_profile,
         caption_safe_zone_bottom_px=caption_safe_zone_bottom_px,
         caption_safe_zone_top_px=caption_safe_zone_top_px,
         caption_font_name=caption_font_name,
@@ -4852,6 +4906,7 @@ def render_testimonial_clip_job(
     caption_max_chars: int | None,
     caption_max_lines: int | None,
     caption_max_words: int | None,
+    caption_safe_zone_profile: str | None,
     caption_safe_zone_bottom_px: int | None,
     caption_safe_zone_top_px: int | None,
     caption_font_name: str | None,
@@ -4898,6 +4953,7 @@ def render_testimonial_clip_job(
         caption_max_chars=caption_max_chars,
         caption_max_lines=caption_max_lines,
         caption_max_words=caption_max_words,
+        caption_safe_zone_profile=caption_safe_zone_profile,
         caption_safe_zone_bottom_px=caption_safe_zone_bottom_px,
         caption_safe_zone_top_px=caption_safe_zone_top_px,
         caption_font_name=caption_font_name,
@@ -4945,6 +5001,7 @@ def render_offer_card_job(
     caption_max_chars: int | None,
     caption_max_lines: int | None,
     caption_max_words: int | None,
+    caption_safe_zone_profile: str | None,
     caption_safe_zone_bottom_px: int | None,
     caption_safe_zone_top_px: int | None,
     caption_font_name: str | None,
@@ -4991,6 +5048,7 @@ def render_offer_card_job(
         caption_max_chars=caption_max_chars,
         caption_max_lines=caption_max_lines,
         caption_max_words=caption_max_words,
+        caption_safe_zone_profile=caption_safe_zone_profile,
         caption_safe_zone_bottom_px=caption_safe_zone_bottom_px,
         caption_safe_zone_top_px=caption_safe_zone_top_px,
         caption_font_name=caption_font_name,
@@ -5025,6 +5083,21 @@ def _primary_variant_preset(quality: str, framing_mode: str) -> str:
     return "mp4_social_vertical_720x1280_safe_pad" if quality == "draft" else "mp4_social_vertical_1080x1920_safe_pad"
 
 
+def _estimate_crop_pct(width: int, height: int, target_ratio: float) -> float | None:
+    if width <= 0 or height <= 0 or target_ratio <= 0:
+        return None
+    input_ratio = float(width) / float(height)
+    if abs(input_ratio - target_ratio) < 0.0001:
+        return 0.0
+    if input_ratio > target_ratio:
+        new_width = float(height) * target_ratio
+        crop_ratio = 1.0 - (new_width / float(width))
+    else:
+        new_height = float(width) / target_ratio
+        crop_ratio = 1.0 - (new_height / float(height))
+    return max(0.0, crop_ratio * 100.0)
+
+
 def render_iterate_job(
     render_type: str,
     primary_asset_id: str,
@@ -5055,6 +5128,7 @@ def render_iterate_job(
     caption_max_chars: int | None,
     caption_max_lines: int | None,
     caption_max_words: int | None,
+    caption_safe_zone_profile: str | None,
     caption_safe_zone_bottom_px: int | None,
     caption_safe_zone_top_px: int | None,
     caption_font_name: str | None,
@@ -5071,6 +5145,16 @@ def render_iterate_job(
     trim_silence: bool | None,
     trim_silence_min_sec: float | None,
     trim_silence_threshold_db: float | None,
+    strategy: str | None,
+    caption_font_size_min: int | None,
+    caption_font_size_max: int | None,
+    caption_box_opacity_min: float | None,
+    caption_box_opacity_max: float | None,
+    music_gain_min: float | None,
+    music_gain_max: float | None,
+    max_crop_pct: float | None,
+    min_duration_sec: float | None,
+    fail_fast: bool | None,
     lock_framing: bool | None,
     lock_captions: bool | None,
     lock_audio: bool | None,
@@ -5119,11 +5203,20 @@ def render_iterate_job(
         caption_max_words = caption_max_words if caption_max_words is not None else (
             brand_kit.get("caption_max_words") if brand_kit else settings.caption_max_words
         )
+        profile_bottom, profile_top = resolve_safe_zone_profile(caption_safe_zone_profile)
         caption_safe_zone_bottom_px = caption_safe_zone_bottom_px if caption_safe_zone_bottom_px is not None else (
-            brand_kit.get("caption_safe_zone_bottom_px") if brand_kit else settings.caption_safe_zone_bottom_px
+            profile_bottom if profile_bottom is not None else (
+                brand_kit.get("caption_safe_zone_bottom_px") if brand_kit else settings.caption_safe_zone_bottom_px
+            )
         )
         caption_safe_zone_top_px = caption_safe_zone_top_px if caption_safe_zone_top_px is not None else (
-            brand_kit.get("caption_safe_zone_top_px") if brand_kit else settings.caption_safe_zone_top_px
+            profile_top if profile_top is not None else (
+                brand_kit.get("caption_safe_zone_top_px") if brand_kit else settings.caption_safe_zone_top_px
+            )
+        )
+
+        caption_box_opacity = caption_box_opacity if caption_box_opacity is not None else (
+            brand_kit.get("caption_box_opacity") if brand_kit else settings.caption_box_opacity
         )
 
         audio_target_lufs = audio_target_lufs if audio_target_lufs is not None else settings.audio_norm_i
@@ -5147,10 +5240,35 @@ def render_iterate_job(
             else settings.audio_silence_db
         )
 
+        strategy = (strategy or "balanced").strip().lower()
+        if strategy not in {"balanced", "captions_first", "audio_first", "framing_first"}:
+            raise JobError("strategy must be balanced, captions_first, audio_first, or framing_first")
+
+        caption_font_size_min = int(caption_font_size_min) if caption_font_size_min is not None else settings.auto_caption_font_size_min
+        caption_font_size_max = int(caption_font_size_max) if caption_font_size_max is not None else settings.auto_caption_font_size_max
+        caption_box_opacity_min = float(caption_box_opacity_min) if caption_box_opacity_min is not None else settings.auto_caption_box_opacity_min
+        caption_box_opacity_max = float(caption_box_opacity_max) if caption_box_opacity_max is not None else settings.auto_caption_box_opacity_max
+        music_gain_min = float(music_gain_min) if music_gain_min is not None else settings.auto_music_gain_min
+        music_gain_max = float(music_gain_max) if music_gain_max is not None else settings.auto_music_gain_max
+        max_crop_pct = float(max_crop_pct) if max_crop_pct is not None else settings.auto_max_crop_pct
+        min_duration_sec = float(min_duration_sec) if min_duration_sec is not None else settings.auto_min_duration_sec
+        fail_fast = bool(fail_fast) if fail_fast is not None else False
+
         lock_framing = bool(lock_framing) if lock_framing is not None else False
         lock_captions = bool(lock_captions) if lock_captions is not None else False
         lock_audio = bool(lock_audio) if lock_audio is not None else False
         allow_trim_silence = True if allow_trim_silence is None else bool(allow_trim_silence)
+
+        if caption_font_size_min > caption_font_size_max:
+            raise JobError("caption_font_size_min exceeds max")
+        if caption_box_opacity_min > caption_box_opacity_max:
+            raise JobError("caption_box_opacity_min exceeds max")
+        if music_gain_min > music_gain_max:
+            raise JobError("music_gain_min exceeds max")
+
+        caption_font_size = int(min(max(caption_font_size, caption_font_size_min), caption_font_size_max))
+        caption_box_opacity = float(min(max(caption_box_opacity, caption_box_opacity_min), caption_box_opacity_max))
+        music_gain = float(min(max(music_gain, music_gain_min), music_gain_max))
 
         rubric_name = rubric_name or _default_rubric_name(render_type)
         rubric = get_rubric(rubric_name)
@@ -5160,6 +5278,25 @@ def render_iterate_job(
         max_iterations = int(max_iterations) if max_iterations is not None else 2
         if max_iterations <= 0:
             raise JobError("max_iterations must be > 0")
+
+        crop_allowed = True
+        if max_crop_pct is not None:
+            max_crop_pct = float(max_crop_pct)
+            if max_crop_pct <= 0:
+                crop_allowed = False
+            else:
+                primary_asset = _get_asset_or_error(primary_asset_id)
+                _ensure_temp_dir()
+                primary_path, primary_cleanup = _resolve_input_path(primary_asset)
+                try:
+                    probe = _probe_optional(primary_path)
+                    if probe and probe.get("width") and probe.get("height"):
+                        crop_pct = _estimate_crop_pct(int(probe["width"]), int(probe["height"]), 9.0 / 16.0)
+                        if crop_pct is not None and crop_pct > max_crop_pct:
+                            crop_allowed = False
+                finally:
+                    if primary_cleanup and os.path.exists(primary_path):
+                        os.remove(primary_path)
 
         iterations: list[dict[str, Any]] = []
         best_result: dict[str, Any] | None = None
@@ -5180,6 +5317,7 @@ def render_iterate_job(
                 "caption_max_lines": caption_max_lines,
                 "caption_max_words": caption_max_words,
                 "caption_font_size": caption_font_size,
+                "caption_box_opacity": caption_box_opacity,
                 "caption_safe_zone_bottom_px": caption_safe_zone_bottom_px,
                 "caption_safe_zone_top_px": caption_safe_zone_top_px,
                 "audio_target_lufs": audio_target_lufs,
@@ -5227,6 +5365,7 @@ def render_iterate_job(
                 caption_max_chars=caption_max_chars,
                 caption_max_lines=caption_max_lines,
                 caption_max_words=caption_max_words,
+                caption_safe_zone_profile=caption_safe_zone_profile,
                 caption_safe_zone_bottom_px=caption_safe_zone_bottom_px,
                 caption_safe_zone_top_px=caption_safe_zone_top_px,
                 caption_font_name=caption_font_name,
@@ -5275,6 +5414,7 @@ def render_iterate_job(
                 caption_max_words,
                 caption_safe_zone_bottom_px,
                 caption_safe_zone_top_px,
+                caption_safe_zone_profile,
                 cache_key=None,
                 job_id_override="",
             )
@@ -5294,6 +5434,7 @@ def render_iterate_job(
                         "caption_max_lines": caption_max_lines,
                         "caption_max_words": caption_max_words,
                         "caption_font_size": caption_font_size,
+                        "caption_box_opacity": caption_box_opacity,
                         "caption_safe_zone_bottom_px": caption_safe_zone_bottom_px,
                         "caption_safe_zone_top_px": caption_safe_zone_top_px,
                         "audio_target_lufs": audio_target_lufs,
@@ -5316,53 +5457,143 @@ def render_iterate_job(
             audio_metrics = analysis.get("audio", {}) if isinstance(analysis, dict) else {}
             caption_metrics = analysis.get("captions", {}) if isinstance(analysis, dict) else {}
 
-            if (
-                video_metrics.get("black_frames_pct") is not None
-                and video_metrics.get("black_frames_pct") > targets.get("black_frames_pct_max", 1.0)
-                and framing_mode == "safe_pad"
-                and not lock_framing
-            ):
-                framing_mode = "crop"
-
-            if caption_metrics.get("safe_zone_violations") and not lock_captions:
-                caption_safe_zone_bottom_px = int(caption_safe_zone_bottom_px or settings.caption_safe_zone_bottom_px) + 16
+            fatal_checks: list[dict[str, str]] = []
+            if fail_fast:
+                has_audio = audio_metrics.get("has_audio")
+                has_video = video_metrics.get("has_video")
+                if has_video is False:
+                    fatal_checks.append({"reason": "missing video track", "fix": "use a valid video source"})
+                if (voice_asset_id or music_asset_id) and has_audio is False:
+                    fatal_checks.append({"reason": "missing audio track", "fix": "check audio inputs"})
+                duration_sec = analysis.get("duration_sec") if isinstance(analysis, dict) else None
+                if duration_sec is not None and min_duration_sec > 0 and float(duration_sec) < min_duration_sec:
+                    fatal_checks.append({"reason": "duration below minimum", "fix": "use a longer source clip"})
+                if video_metrics.get("resolution_ok") is False:
+                    fatal_checks.append({"reason": "resolution below target", "fix": "use higher-resolution media"})
+                if (captions_srt or captions_vtt or words_json) and caption_metrics.get("segment_count") in {0, None}:
+                    fatal_checks.append({"reason": "captions empty or unparsable", "fix": "check caption input format"})
+            if fatal_checks:
+                qa = analysis.get("qa") if isinstance(analysis, dict) else None
+                if not isinstance(qa, dict):
+                    qa = qa_from_report(analysis, rubric, target_preset)
+                qa["pass"] = False
+                qa["failed_checks"] = [item["reason"] for item in fatal_checks[:3]]
+                qa["recommended_fix"] = fatal_checks[0]["fix"]
+                analysis["qa"] = qa
+                iterations[-1]["analysis"] = analysis
+                best_result = iterations[-1]
+                break
 
             readability = caption_metrics.get("caption_readability_score")
-            if readability is not None and readability < targets.get("caption_readability_min", 70.0) and not lock_captions:
-                caption_max_chars = max(40, int(caption_max_chars) - 6)
-                caption_max_words = max(6, int(caption_max_words) - 1)
-                caption_max_lines = min(3, int(caption_max_lines) + 1)
-                caption_font_size = max(settings.min_font_size, int(caption_font_size) - 2)
-
             speed_wpm = caption_metrics.get("caption_speed_wpm")
-            if speed_wpm and speed_wpm > targets.get("caption_speed_wpm_max", 180.0) and not lock_captions:
-                caption_max_words = max(5, int(caption_max_words) - 1)
-
             loudness = audio_metrics.get("loudness_lufs")
-            if loudness is not None and not lock_audio:
+            true_peak = audio_metrics.get("true_peak_db")
+            silence_pct = audio_metrics.get("silence_pct")
+
+            caption_needs = False
+            if not lock_captions:
+                if caption_metrics.get("safe_zone_violations"):
+                    caption_needs = True
+                if readability is not None and readability < targets.get("caption_readability_min", 70.0):
+                    caption_needs = True
+                if speed_wpm and speed_wpm > targets.get("caption_speed_wpm_max", 180.0):
+                    caption_needs = True
+
+            audio_needs = False
+            if not lock_audio:
                 target_lufs = float(targets.get("loudness_lufs", -16.0))
                 tolerance = float(targets.get("loudness_tolerance", 2.5))
-                if loudness < target_lufs - tolerance:
-                    audio_target_lufs = min(-12.0, float(audio_target_lufs) + 1.0)
-                elif loudness > target_lufs + tolerance:
-                    audio_target_lufs = max(-23.0, float(audio_target_lufs) - 1.0)
+                if loudness is not None and (loudness < target_lufs - tolerance or loudness > target_lufs + tolerance):
+                    audio_needs = True
+                if true_peak is not None and true_peak > targets.get("true_peak_max_db", -1.5):
+                    audio_needs = True
+                if (
+                    silence_pct is not None
+                    and silence_pct > targets.get("silence_pct_max", 5.0)
+                    and voice_asset_id
+                    and allow_trim_silence
+                ):
+                    audio_needs = True
 
-            true_peak = audio_metrics.get("true_peak_db")
-            if true_peak is not None and true_peak > targets.get("true_peak_max_db", -1.5) and not lock_audio:
-                audio_true_peak = min(float(audio_true_peak), targets.get("true_peak_max_db", -1.5))
-                music_gain = max(0.4, float(music_gain) - 0.05)
+            framing_needs = False
+            if not lock_framing and crop_allowed:
+                if (
+                    video_metrics.get("black_frames_pct") is not None
+                    and video_metrics.get("black_frames_pct") > targets.get("black_frames_pct_max", 1.0)
+                    and framing_mode == "safe_pad"
+                ):
+                    framing_needs = True
 
-            silence_pct = audio_metrics.get("silence_pct")
-            if (
-                silence_pct is not None
-                and silence_pct > targets.get("silence_pct_max", 5.0)
-                and voice_asset_id
-                and not lock_audio
-                and allow_trim_silence
-            ):
-                trim_silence = True
-                trim_silence_min_sec = max(0.2, float(trim_silence_min_sec) - 0.1)
-                trim_silence_threshold_db = min(-20.0, float(trim_silence_threshold_db) + 2.0)
+            def apply_caption_adjustments() -> None:
+                nonlocal caption_safe_zone_bottom_px, caption_max_chars, caption_max_words, caption_max_lines
+                nonlocal caption_font_size, caption_box_opacity
+                if caption_metrics.get("safe_zone_violations"):
+                    caption_safe_zone_bottom_px = int(caption_safe_zone_bottom_px or settings.caption_safe_zone_bottom_px) + 16
+                if readability is not None and readability < targets.get("caption_readability_min", 70.0):
+                    caption_max_chars = max(40, int(caption_max_chars) - 6)
+                    caption_max_words = max(6, int(caption_max_words) - 1)
+                    caption_max_lines = min(3, int(caption_max_lines) + 1)
+                    caption_font_size = max(caption_font_size_min, int(caption_font_size) - 2)
+                    if caption_box_opacity < caption_box_opacity_max:
+                        caption_box_opacity = min(
+                            caption_box_opacity_max,
+                            float(caption_box_opacity) + 0.05,
+                        )
+                if speed_wpm and speed_wpm > targets.get("caption_speed_wpm_max", 180.0):
+                    caption_max_words = max(5, int(caption_max_words) - 1)
+
+            def apply_audio_adjustments() -> None:
+                nonlocal audio_target_lufs, audio_true_peak, music_gain, trim_silence
+                nonlocal trim_silence_min_sec, trim_silence_threshold_db
+                target_lufs = float(targets.get("loudness_lufs", -16.0))
+                tolerance = float(targets.get("loudness_tolerance", 2.5))
+                if loudness is not None:
+                    if loudness < target_lufs - tolerance:
+                        audio_target_lufs = min(-12.0, float(audio_target_lufs) + 1.0)
+                    elif loudness > target_lufs + tolerance:
+                        audio_target_lufs = max(-23.0, float(audio_target_lufs) - 1.0)
+                if true_peak is not None and true_peak > targets.get("true_peak_max_db", -1.5):
+                    audio_true_peak = min(float(audio_true_peak), targets.get("true_peak_max_db", -1.5))
+                    music_gain = max(music_gain_min, float(music_gain) - 0.05)
+                if (
+                    silence_pct is not None
+                    and silence_pct > targets.get("silence_pct_max", 5.0)
+                    and voice_asset_id
+                    and allow_trim_silence
+                ):
+                    trim_silence = True
+                    trim_silence_min_sec = max(0.2, float(trim_silence_min_sec) - 0.1)
+                    trim_silence_threshold_db = min(-20.0, float(trim_silence_threshold_db) + 2.0)
+                music_gain = float(min(max(music_gain, music_gain_min), music_gain_max))
+
+            def apply_framing_adjustments() -> None:
+                nonlocal framing_mode
+                if framing_needs:
+                    framing_mode = "crop"
+
+            if strategy == "balanced":
+                if framing_needs:
+                    apply_framing_adjustments()
+                if caption_needs:
+                    apply_caption_adjustments()
+                if audio_needs:
+                    apply_audio_adjustments()
+            else:
+                strategy_order = {
+                    "captions_first": ["captions", "audio", "framing"],
+                    "audio_first": ["audio", "captions", "framing"],
+                    "framing_first": ["framing", "captions", "audio"],
+                }[strategy]
+                for item in strategy_order:
+                    if item == "captions" and caption_needs:
+                        apply_caption_adjustments()
+                        break
+                    if item == "audio" and audio_needs:
+                        apply_audio_adjustments()
+                        break
+                    if item == "framing" and framing_needs:
+                        apply_framing_adjustments()
+                        break
 
             update_job(
                 job_id,

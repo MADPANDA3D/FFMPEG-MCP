@@ -219,7 +219,8 @@ Burn-in captions (`captions_burn_in`):
 - `words_json` shape: `[{ "word": "Hello", "start": 1.23, "end": 1.56 }]` (seconds)
 - Optional: `brand_kit_id`, `highlight_mode="word"`, `position`, `font_size`, `font_color`,
   `box_color`, `box_opacity`, `padding_px`, `max_chars`, `max_lines`, `max_words`,
-  `safe_zone_bottom_px`, `safe_zone_top_px`, `font_name`, `font_asset_id`
+  `safe_zone_bottom_px`, `safe_zone_top_px`, `safe_zone_profile`, `font_name`, `font_asset_id`
+  (`safe_zone_profile`: `tiktok|reels|shorts`)
 
 ## Marketing render tools
 
@@ -236,6 +237,9 @@ Defaults:
 
 Caption inputs: pass `captions_srt`, `captions_vtt`, or `words_json` to generate captioned outputs.
 Iteration constraints: `lock_framing`, `lock_captions`, `lock_audio`, `allow_trim_silence`.
+Iteration strategy/bounds (render_iterate): `strategy` (`captions_first|audio_first|framing_first|balanced`),
+`caption_font_size_min/max`, `caption_box_opacity_min/max`, `music_gain_min/max`,
+`max_crop_pct`, `min_duration_sec`, `fail_fast`.
 
 ## Analysis + QA
 
@@ -246,6 +250,7 @@ Iteration constraints: `lock_framing`, `lock_captions`, `lock_audio`, `allow_tri
 - Rubrics include `social_reel_v1`, `testimonial_v1`, `insta_reel_v1`, `youtube_short_v1`.
 - `job_status` includes `qa` (pass/score/failed_checks/recommended_fix) plus
   `report` (analyze), `ranking` (compare), and `result` (iterate).
+- `qa.fingerprint` hashes rubric + targets + overrides for reproducibility.
 - `render_iterate` includes `iterations[].changes` for compact diffs.
 
 ## Templates

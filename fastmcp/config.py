@@ -173,6 +173,14 @@ class Settings:
     caption_padding_px: int = _get_int("CAPTION_PADDING_PX", 24)
     caption_safe_zone_bottom_px: int = _get_int("CAPTION_SAFE_ZONE_BOTTOM_PX", 96)
     caption_safe_zone_top_px: int = _get_int("CAPTION_SAFE_ZONE_TOP_PX", 64)
+    auto_caption_font_size_min: int = _get_int("AUTO_CAPTION_FONT_SIZE_MIN", 16)
+    auto_caption_font_size_max: int = _get_int("AUTO_CAPTION_FONT_SIZE_MAX", 160)
+    auto_caption_box_opacity_min: float = _get_float("AUTO_CAPTION_BOX_OPACITY_MIN", 0.4)
+    auto_caption_box_opacity_max: float = _get_float("AUTO_CAPTION_BOX_OPACITY_MAX", 0.85)
+    auto_music_gain_min: float = _get_float("AUTO_MUSIC_GAIN_MIN", 0.4)
+    auto_music_gain_max: float = _get_float("AUTO_MUSIC_GAIN_MAX", 1.0)
+    auto_max_crop_pct: float = _get_float("AUTO_MAX_CROP_PCT", 45.0)
+    auto_min_duration_sec: float = _get_float("AUTO_MIN_DURATION_SEC", 0.0)
 
     social_presets: list[str] = field(
         default_factory=lambda: _split_csv(

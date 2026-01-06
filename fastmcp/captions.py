@@ -6,6 +6,22 @@ TIME_RE = re.compile(
     r"(?P<hours>\d{1,2}):(?P<minutes>\d{2}):(?P<seconds>\d{2})(?P<millis>[.,]\d{1,3})?"
 )
 
+SAFE_ZONE_PROFILES: dict[str, dict[str, int]] = {
+    "tiktok": {"bottom_px": 160, "top_px": 80},
+    "reels": {"bottom_px": 140, "top_px": 72},
+    "shorts": {"bottom_px": 120, "top_px": 72},
+}
+
+
+def resolve_safe_zone_profile(profile: str | None) -> tuple[int | None, int | None]:
+    if not profile:
+        return None, None
+    key = profile.strip().lower()
+    values = SAFE_ZONE_PROFILES.get(key)
+    if not values:
+        return None, None
+    return int(values["bottom_px"]), int(values["top_px"])
+
 
 def parse_timecode(value: str) -> float | None:
     value = (value or "").strip()

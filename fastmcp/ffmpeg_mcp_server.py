@@ -14,6 +14,7 @@ import uvicorn
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from brand_kits import sanitize_brand_kit
+from captions import SAFE_ZONE_PROFILES
 from cleanup import cleanup_loop
 from config import settings
 from discord_export import DiscordExportError, send_file
@@ -347,11 +348,20 @@ def _derive_qa(job_record: dict) -> dict:
                     if rubric:
                         return qa_from_report(analysis, rubric, analysis.get("target_preset"))
 
-    return {"pass": None, "score": None, "failed_checks": [], "recommended_fix": None}
+    return {"pass": None, "score": None, "failed_checks": [], "recommended_fix": None, "fingerprint": None}
 
 
 def _build_cache_key(job_type: str, payload: dict) -> str:
     return build_cache_key(f"ffmpeg:{job_type}", payload)
+
+
+def _normalize_safe_zone_profile(profile: str | None) -> str | None:
+    if not profile:
+        return None
+    value = profile.strip().lower()
+    if value not in SAFE_ZONE_PROFILES:
+        raise ValueError(f"safe_zone_profile must be one of: {', '.join(sorted(SAFE_ZONE_PROFILES.keys()))}")
+    return value
 
 
 def _resolve_cached_payload(cache_key: str) -> dict | None:
@@ -799,6 +809,7 @@ async def tool_captions_burn_in(
     max_chars: int | None = None,
     max_lines: int | None = None,
     max_words: int | None = None,
+    safe_zone_profile: str | None = None,
     safe_zone_bottom_px: int | None = None,
     safe_zone_top_px: int | None = None,
     font_name: str | None = None,
@@ -815,6 +826,7 @@ async def tool_captions_burn_in(
         raise ValueError("brand_kit_id not found")
     if highlight_mode:
         highlight_mode = highlight_mode.strip().lower()
+    safe_zone_profile = _normalize_safe_zone_profile(safe_zone_profile)
 
     cache_key = _build_cache_key(
         "captions_burn_in",
@@ -835,6 +847,7 @@ async def tool_captions_burn_in(
             "max_chars": max_chars,
             "max_lines": max_lines,
             "max_words": max_words,
+            "safe_zone_profile": safe_zone_profile,
             "safe_zone_bottom_px": safe_zone_bottom_px,
             "safe_zone_top_px": safe_zone_top_px,
             "font_name": font_name,
@@ -865,6 +878,7 @@ async def tool_captions_burn_in(
             max_chars,
             max_lines,
             max_words,
+            safe_zone_profile,
             safe_zone_bottom_px,
             safe_zone_top_px,
             font_name,
@@ -895,6 +909,7 @@ async def tool_video_analyze(
     max_words: int | None = None,
     safe_zone_bottom_px: int | None = None,
     safe_zone_top_px: int | None = None,
+    safe_zone_profile: str | None = None,
     priority: str | None = None,
 ) -> dict:
     if not get_asset(asset_id):
@@ -911,6 +926,7 @@ async def tool_video_analyze(
         describe_rubric(rubric_name)
     if reference_asset_id and not get_asset(reference_asset_id):
         raise ValueError("reference_asset_id not found")
+    safe_zone_profile = _normalize_safe_zone_profile(safe_zone_profile)
 
     cache_key = _build_cache_key(
         "video_analyze",
@@ -931,6 +947,7 @@ async def tool_video_analyze(
             "max_words": max_words,
             "safe_zone_bottom_px": safe_zone_bottom_px,
             "safe_zone_top_px": safe_zone_top_px,
+            "safe_zone_profile": safe_zone_profile,
         },
     )
     cached_payload = _resolve_cached_payload(cache_key)
@@ -968,6 +985,7 @@ async def tool_video_analyze(
             max_words,
             safe_zone_bottom_px,
             safe_zone_top_px,
+            safe_zone_profile,
             cache_key,
         ),
         cache_key=cache_key,
@@ -1800,6 +1818,7 @@ async def tool_render_social_ad(
     caption_max_chars: int | None = None,
     caption_max_lines: int | None = None,
     caption_max_words: int | None = None,
+    safe_zone_profile: str | None = None,
     caption_safe_zone_bottom_px: int | None = None,
     caption_safe_zone_top_px: int | None = None,
     caption_font_name: str | None = None,
@@ -1848,6 +1867,7 @@ async def tool_render_social_ad(
         framing_mode = framing_mode.strip().lower()
         if framing_mode not in {"safe_pad", "crop"}:
             raise ValueError("framing_mode must be 'safe_pad' or 'crop'")
+    safe_zone_profile = _normalize_safe_zone_profile(safe_zone_profile)
 
     cache_key = _build_cache_key(
         "render_social_ad",
@@ -1878,6 +1898,7 @@ async def tool_render_social_ad(
             "caption_max_chars": caption_max_chars,
             "caption_max_lines": caption_max_lines,
             "caption_max_words": caption_max_words,
+            "safe_zone_profile": safe_zone_profile,
             "caption_safe_zone_bottom_px": caption_safe_zone_bottom_px,
             "caption_safe_zone_top_px": caption_safe_zone_top_px,
             "caption_font_name": caption_font_name,
@@ -1930,6 +1951,7 @@ async def tool_render_social_ad(
             caption_max_chars,
             caption_max_lines,
             caption_max_words,
+            safe_zone_profile,
             caption_safe_zone_bottom_px,
             caption_safe_zone_top_px,
             caption_font_name,
@@ -1980,6 +2002,7 @@ async def tool_render_testimonial_clip(
     caption_max_chars: int | None = None,
     caption_max_lines: int | None = None,
     caption_max_words: int | None = None,
+    safe_zone_profile: str | None = None,
     caption_safe_zone_bottom_px: int | None = None,
     caption_safe_zone_top_px: int | None = None,
     caption_font_name: str | None = None,
@@ -2028,6 +2051,7 @@ async def tool_render_testimonial_clip(
         framing_mode = framing_mode.strip().lower()
         if framing_mode not in {"safe_pad", "crop"}:
             raise ValueError("framing_mode must be 'safe_pad' or 'crop'")
+    safe_zone_profile = _normalize_safe_zone_profile(safe_zone_profile)
 
     cache_key = _build_cache_key(
         "render_testimonial_clip",
@@ -2056,6 +2080,7 @@ async def tool_render_testimonial_clip(
             "caption_max_chars": caption_max_chars,
             "caption_max_lines": caption_max_lines,
             "caption_max_words": caption_max_words,
+            "safe_zone_profile": safe_zone_profile,
             "caption_safe_zone_bottom_px": caption_safe_zone_bottom_px,
             "caption_safe_zone_top_px": caption_safe_zone_top_px,
             "caption_font_name": caption_font_name,
@@ -2106,6 +2131,7 @@ async def tool_render_testimonial_clip(
             caption_max_chars,
             caption_max_lines,
             caption_max_words,
+            safe_zone_profile,
             caption_safe_zone_bottom_px,
             caption_safe_zone_top_px,
             caption_font_name,
@@ -2157,6 +2183,7 @@ async def tool_render_offer_card(
     caption_max_chars: int | None = None,
     caption_max_lines: int | None = None,
     caption_max_words: int | None = None,
+    safe_zone_profile: str | None = None,
     caption_safe_zone_bottom_px: int | None = None,
     caption_safe_zone_top_px: int | None = None,
     caption_font_name: str | None = None,
@@ -2205,6 +2232,7 @@ async def tool_render_offer_card(
         framing_mode = framing_mode.strip().lower()
         if framing_mode not in {"safe_pad", "crop"}:
             raise ValueError("framing_mode must be 'safe_pad' or 'crop'")
+    safe_zone_profile = _normalize_safe_zone_profile(safe_zone_profile)
 
     cache_key = _build_cache_key(
         "render_offer_card",
@@ -2234,6 +2262,7 @@ async def tool_render_offer_card(
             "caption_max_chars": caption_max_chars,
             "caption_max_lines": caption_max_lines,
             "caption_max_words": caption_max_words,
+            "safe_zone_profile": safe_zone_profile,
             "caption_safe_zone_bottom_px": caption_safe_zone_bottom_px,
             "caption_safe_zone_top_px": caption_safe_zone_top_px,
             "caption_font_name": caption_font_name,
@@ -2285,6 +2314,7 @@ async def tool_render_offer_card(
             caption_max_chars,
             caption_max_lines,
             caption_max_words,
+            safe_zone_profile,
             caption_safe_zone_bottom_px,
             caption_safe_zone_top_px,
             caption_font_name,
@@ -2340,6 +2370,7 @@ async def tool_render_iterate(
     caption_max_chars: int | None = None,
     caption_max_lines: int | None = None,
     caption_max_words: int | None = None,
+    safe_zone_profile: str | None = None,
     caption_safe_zone_bottom_px: int | None = None,
     caption_safe_zone_top_px: int | None = None,
     caption_font_name: str | None = None,
@@ -2356,6 +2387,16 @@ async def tool_render_iterate(
     trim_silence: bool | None = None,
     trim_silence_min_sec: float | None = None,
     trim_silence_threshold_db: float | None = None,
+    strategy: str | None = None,
+    caption_font_size_min: int | None = None,
+    caption_font_size_max: int | None = None,
+    caption_box_opacity_min: float | None = None,
+    caption_box_opacity_max: float | None = None,
+    music_gain_min: float | None = None,
+    music_gain_max: float | None = None,
+    max_crop_pct: float | None = None,
+    min_duration_sec: float | None = None,
+    fail_fast: bool | None = None,
     lock_framing: bool | None = None,
     lock_captions: bool | None = None,
     lock_audio: bool | None = None,
@@ -2400,6 +2441,7 @@ async def tool_render_iterate(
         framing_mode = framing_mode.strip().lower()
         if framing_mode not in {"safe_pad", "crop"}:
             raise ValueError("framing_mode must be 'safe_pad' or 'crop'")
+    safe_zone_profile = _normalize_safe_zone_profile(safe_zone_profile)
     if rubric_name:
         describe_rubric(rubric_name)
     if max_iterations is not None and int(max_iterations) <= 0:
@@ -2437,6 +2479,7 @@ async def tool_render_iterate(
             "caption_max_chars": caption_max_chars,
             "caption_max_lines": caption_max_lines,
             "caption_max_words": caption_max_words,
+            "safe_zone_profile": safe_zone_profile,
             "caption_safe_zone_bottom_px": caption_safe_zone_bottom_px,
             "caption_safe_zone_top_px": caption_safe_zone_top_px,
             "caption_font_name": caption_font_name,
@@ -2453,6 +2496,16 @@ async def tool_render_iterate(
             "trim_silence": trim_silence,
             "trim_silence_min_sec": trim_silence_min_sec,
             "trim_silence_threshold_db": trim_silence_threshold_db,
+            "strategy": strategy,
+            "caption_font_size_min": caption_font_size_min,
+            "caption_font_size_max": caption_font_size_max,
+            "caption_box_opacity_min": caption_box_opacity_min,
+            "caption_box_opacity_max": caption_box_opacity_max,
+            "music_gain_min": music_gain_min,
+            "music_gain_max": music_gain_max,
+            "max_crop_pct": max_crop_pct,
+            "min_duration_sec": min_duration_sec,
+            "fail_fast": fail_fast,
             "lock_framing": lock_framing,
             "lock_captions": lock_captions,
             "lock_audio": lock_audio,
@@ -2510,6 +2563,7 @@ async def tool_render_iterate(
             caption_max_chars,
             caption_max_lines,
             caption_max_words,
+            safe_zone_profile,
             caption_safe_zone_bottom_px,
             caption_safe_zone_top_px,
             caption_font_name,
@@ -2526,6 +2580,16 @@ async def tool_render_iterate(
             trim_silence,
             trim_silence_min_sec,
             trim_silence_threshold_db,
+            strategy,
+            caption_font_size_min,
+            caption_font_size_max,
+            caption_box_opacity_min,
+            caption_box_opacity_max,
+            music_gain_min,
+            music_gain_max,
+            max_crop_pct,
+            min_duration_sec,
+            fail_fast,
             lock_framing,
             lock_captions,
             lock_audio,
@@ -2643,6 +2707,15 @@ async def tool_capabilities() -> dict:
             "caption_padding_px": settings.caption_padding_px,
             "caption_safe_zone_bottom_px": settings.caption_safe_zone_bottom_px,
             "caption_safe_zone_top_px": settings.caption_safe_zone_top_px,
+            "caption_safe_zone_profiles": sorted(SAFE_ZONE_PROFILES.keys()),
+            "auto_caption_font_size_min": settings.auto_caption_font_size_min,
+            "auto_caption_font_size_max": settings.auto_caption_font_size_max,
+            "auto_caption_box_opacity_min": settings.auto_caption_box_opacity_min,
+            "auto_caption_box_opacity_max": settings.auto_caption_box_opacity_max,
+            "auto_music_gain_min": settings.auto_music_gain_min,
+            "auto_music_gain_max": settings.auto_music_gain_max,
+            "auto_max_crop_pct": settings.auto_max_crop_pct,
+            "auto_min_duration_sec": settings.auto_min_duration_sec,
             "draft_max_dimension": settings.draft_max_dimension,
             "draft_crf": settings.draft_crf,
             "draft_preset": settings.draft_preset,
@@ -2763,7 +2836,13 @@ async def tool_job_status(job_id: str) -> dict:
             "progress": None,
             "progress_pct": None,
             "output_asset_ids": None,
-            "qa": {"pass": None, "score": None, "failed_checks": [], "recommended_fix": None},
+            "qa": {
+                "pass": None,
+                "score": None,
+                "failed_checks": [],
+                "recommended_fix": None,
+                "fingerprint": None,
+            },
             "error": None,
             "logs_short": None,
             "last_log_line": None,

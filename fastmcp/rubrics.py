@@ -1,3 +1,5 @@
+import hashlib
+import json
 import re
 from typing import Any
 
@@ -376,9 +378,16 @@ def qa_from_report(
     report: dict[str, Any],
     rubric: dict[str, Any],
     target_preset: str | None = None,
+    overrides: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if not report or not rubric:
-        return {"pass": None, "score": None, "failed_checks": [], "recommended_fix": None}
+        return {
+            "pass": None,
+            "score": None,
+            "failed_checks": [],
+            "recommended_fix": None,
+            "fingerprint": None,
+        }
     scored = score_report(report, rubric, target_preset)
     failures = _find_failures(report, rubric, target_preset)
     failed_checks = [item["reason"] for item in failures[:3]]
@@ -388,7 +397,24 @@ def qa_from_report(
         "score": scored.get("score"),
         "failed_checks": failed_checks,
         "recommended_fix": recommended_fix,
+        "fingerprint": qa_fingerprint(rubric, target_preset, overrides),
     }
+
+
+def qa_fingerprint(
+    rubric: dict[str, Any],
+    target_preset: str | None,
+    overrides: dict[str, Any] | None = None,
+) -> str:
+    payload = {
+        "pass_threshold": rubric.get("pass_threshold"),
+        "targets": rubric.get("targets", {}),
+        "weights": _resolve_weights(rubric, target_preset),
+        "target_preset": target_preset,
+        "overrides": overrides or {},
+    }
+    raw = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
 def _find_failures(
