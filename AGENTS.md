@@ -7,6 +7,11 @@ serves as a living checklist for consistency.
 Snippet (keep this line in the file):
 open to edit as work progresses
 
+## Workflow requirements
+
+- After any code or config change, rebuild and restart the container.
+- Commit the changes after committing push to main.
+
 ## Reference servers (read-only notes)
 
 google-mcp

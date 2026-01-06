@@ -147,7 +147,12 @@ def sanitize_color(value: str | None, default: str) -> str:
 
 
 def escape_drawtext_value(value: str) -> str:
-    return value.replace("\\", "\\\\").replace(":", "\\:").replace(",", "\\,")
+    return (
+        value.replace("\\", "\\\\")
+        .replace(":", "\\:")
+        .replace(",", "\\,")
+        .replace("\n", "\\n")
+    )
 
 
 def _is_within_dir(path: str, base_dir: str) -> bool:

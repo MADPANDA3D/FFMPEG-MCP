@@ -8,6 +8,7 @@ from urllib.parse import parse_qs
 
 import aiofiles
 from mcp.server.fastmcp import FastMCP
+from rq import Queue
 from rq.job import Job
 import uvicorn
 from starlette.middleware.trustedhost import TrustedHostMiddleware
@@ -20,6 +21,7 @@ from drive_utils import DriveError, upload_file
 from ffprobe_utils import run_ffprobe
 from ingest import IngestError, ingest_from_url
 from jobs import (
+    asset_compare_job,
     audio_duck_job,
     audio_fade_job,
     audio_mix_job,
@@ -28,11 +30,16 @@ from jobs import (
     audio_trim_silence_job,
     batch_export_job,
     brand_kit_apply_job,
+    captions_burn_in_job,
     campaign_process_job,
     extract_audio_job,
     image_to_video_job,
     images_to_slideshow_job,
     images_to_slideshow_ken_burns_job,
+    render_offer_card_job,
+    render_iterate_job,
+    render_social_ad_job,
+    render_testimonial_clip_job,
     template_apply_job,
     thumbnail_job,
     transcode_job,
@@ -40,9 +47,10 @@ from jobs import (
     video_concat_job,
     video_add_logo_job,
     video_add_text_job,
+    video_analyze_job,
     workflow_job,
 )
-from metrics import log_event, record_cache_hit, record_cache_miss
+from metrics import collect_metrics_snapshot, log_event, record_cache_hit, record_cache_miss
 from overlay_utils import (
     DEFAULT_BOX_BORDER_WIDTH,
     DEFAULT_BOX_COLOR,
@@ -63,6 +71,7 @@ from overlay_utils import (
     sanitize_text,
 )
 from presets import describe_preset, get_preset, list_presets
+from rubrics import describe_rubric, list_rubrics
 from templates import describe_template, list_templates
 from task_queue import get_queue
 from redis_store import (
@@ -72,6 +81,7 @@ from redis_store import (
     get_brand_kit,
     get_cached_result,
     get_job,
+    get_redis,
     list_brand_kits,
     save_brand_kit,
     delete_brand_kit,
@@ -296,14 +306,11 @@ def _build_cache_key(job_type: str, payload: dict) -> str:
     return build_cache_key(f"ffmpeg:{job_type}", payload)
 
 
-def _resolve_cached_outputs(cache_key: str) -> list[str] | None:
+def _resolve_cached_payload(cache_key: str) -> dict | None:
     cached = get_cached_result(cache_key)
     if not cached:
         return None
-    output_ids = cached.get("output_asset_ids")
-    if not output_ids:
-        delete_cached_result(cache_key)
-        return None
+    output_ids = cached.get("output_asset_ids") or []
     for asset_id in output_ids:
         asset = get_asset(asset_id)
         if not asset:
@@ -313,10 +320,27 @@ def _resolve_cached_outputs(cache_key: str) -> list[str] | None:
         if expires_at and int(expires_at) <= utc_now_ts():
             delete_cached_result(cache_key)
             return None
+    return cached
+
+
+def _resolve_cached_outputs(cache_key: str) -> list[str] | None:
+    cached = _resolve_cached_payload(cache_key)
+    if not cached:
+        return None
+    output_ids = cached.get("output_asset_ids")
+    if not output_ids:
+        delete_cached_result(cache_key)
+        return None
     return list(output_ids)
 
 
-def _record_cached_job(job_type: str, input_asset_id: str, output_asset_ids: list[str], cache_key: str) -> str:
+def _record_cached_job(
+    job_type: str,
+    input_asset_id: str,
+    output_asset_ids: list[str],
+    cache_key: str,
+    extra: dict | None = None,
+) -> str:
     job_id = uuid.uuid4().hex
     now = utc_now_iso()
     job = {
@@ -335,6 +359,8 @@ def _record_cached_job(job_type: str, input_asset_id: str, output_asset_ids: lis
         "started_at": now,
         "finished_at": now,
     }
+    if extra:
+        job.update(extra)
     save_job(job, settings.job_ttl_seconds())
     record_cache_hit(job_type)
     log_event(
@@ -704,6 +730,243 @@ async def tool_video_add_logo(
         cache_key=cache_key,
         priority=priority,
         job_timeout=settings.logo_timeout_seconds(),
+    )
+    return {"job_id": job_id, "cache_hit": False}
+
+
+async def tool_captions_burn_in(
+    asset_id: str,
+    captions_srt: str | None = None,
+    captions_vtt: str | None = None,
+    words_json: list[dict] | None = None,
+    brand_kit_id: str | None = None,
+    highlight_mode: str | None = None,
+    position: str | None = None,
+    font_size: int | None = None,
+    font_color: str | None = None,
+    box_color: str | None = None,
+    box_opacity: float | None = None,
+    highlight_color: str | None = None,
+    padding_px: int | None = None,
+    max_chars: int | None = None,
+    max_lines: int | None = None,
+    max_words: int | None = None,
+    safe_zone_bottom_px: int | None = None,
+    safe_zone_top_px: int | None = None,
+    font_name: str | None = None,
+    font_asset_id: str | None = None,
+    priority: str | None = None,
+) -> dict:
+    if not get_asset(asset_id):
+        raise ValueError("asset_id not found")
+    if sum(bool(value) for value in [captions_srt, captions_vtt, words_json]) != 1:
+        raise ValueError("Provide exactly one of captions_srt, captions_vtt, words_json")
+    if words_json is not None and not isinstance(words_json, list):
+        raise ValueError("words_json must be a list")
+    if brand_kit_id and not get_brand_kit(brand_kit_id):
+        raise ValueError("brand_kit_id not found")
+    if highlight_mode:
+        highlight_mode = highlight_mode.strip().lower()
+
+    cache_key = _build_cache_key(
+        "captions_burn_in",
+        {
+            "asset_id": asset_id,
+            "captions_srt": captions_srt,
+            "captions_vtt": captions_vtt,
+            "words_json": words_json,
+            "brand_kit_id": brand_kit_id,
+            "highlight_mode": highlight_mode,
+            "position": position,
+            "font_size": font_size,
+            "font_color": font_color,
+            "box_color": box_color,
+            "box_opacity": box_opacity,
+            "highlight_color": highlight_color,
+            "padding_px": padding_px,
+            "max_chars": max_chars,
+            "max_lines": max_lines,
+            "max_words": max_words,
+            "safe_zone_bottom_px": safe_zone_bottom_px,
+            "safe_zone_top_px": safe_zone_top_px,
+            "font_name": font_name,
+            "font_asset_id": font_asset_id,
+        },
+    )
+    cached_outputs = _resolve_cached_outputs(cache_key)
+    if cached_outputs:
+        job_id = _record_cached_job("captions_burn_in", asset_id, cached_outputs, cache_key)
+        return {"job_id": job_id, "cache_hit": True, "output_asset_ids": cached_outputs}
+    job_id = _enqueue_job(
+        "captions_burn_in",
+        captions_burn_in_job,
+        (
+            asset_id,
+            captions_srt,
+            captions_vtt,
+            words_json,
+            brand_kit_id,
+            highlight_mode,
+            position,
+            font_size,
+            font_color,
+            box_color,
+            box_opacity,
+            highlight_color,
+            padding_px,
+            max_chars,
+            max_lines,
+            max_words,
+            safe_zone_bottom_px,
+            safe_zone_top_px,
+            font_name,
+            font_asset_id,
+            cache_key,
+        ),
+        cache_key=cache_key,
+        priority=priority,
+        job_timeout=settings.text_timeout_seconds(),
+    )
+    return {"job_id": job_id, "cache_hit": False}
+
+
+async def tool_video_analyze(
+    asset_id: str,
+    rubric_name: str | None = None,
+    target_preset: str | None = None,
+    captions_srt: str | None = None,
+    captions_vtt: str | None = None,
+    words_json: list[dict] | None = None,
+    brand_kit_id: str | None = None,
+    position: str | None = None,
+    font_size: int | None = None,
+    padding_px: int | None = None,
+    max_chars: int | None = None,
+    max_lines: int | None = None,
+    max_words: int | None = None,
+    safe_zone_bottom_px: int | None = None,
+    safe_zone_top_px: int | None = None,
+    priority: str | None = None,
+) -> dict:
+    if not get_asset(asset_id):
+        raise ValueError("asset_id not found")
+    if sum(bool(value) for value in [captions_srt, captions_vtt, words_json]) > 1:
+        raise ValueError("Provide only one of captions_srt, captions_vtt, words_json")
+    if words_json is not None and not isinstance(words_json, list):
+        raise ValueError("words_json must be a list")
+    if brand_kit_id and not get_brand_kit(brand_kit_id):
+        raise ValueError("brand_kit_id not found")
+    if target_preset:
+        get_preset(target_preset)
+    if rubric_name:
+        describe_rubric(rubric_name)
+
+    cache_key = _build_cache_key(
+        "video_analyze",
+        {
+            "asset_id": asset_id,
+            "rubric_name": rubric_name,
+            "target_preset": target_preset,
+            "captions_srt": captions_srt,
+            "captions_vtt": captions_vtt,
+            "words_json": words_json,
+            "brand_kit_id": brand_kit_id,
+            "position": position,
+            "font_size": font_size,
+            "padding_px": padding_px,
+            "max_chars": max_chars,
+            "max_lines": max_lines,
+            "max_words": max_words,
+            "safe_zone_bottom_px": safe_zone_bottom_px,
+            "safe_zone_top_px": safe_zone_top_px,
+        },
+    )
+    cached_payload = _resolve_cached_payload(cache_key)
+    if cached_payload and cached_payload.get("report"):
+        report = cached_payload.get("report")
+        output_ids = cached_payload.get("output_asset_ids") or [asset_id]
+        job_id = _record_cached_job(
+            "video_analyze",
+            asset_id,
+            list(output_ids),
+            cache_key,
+            extra={"report": report},
+        )
+        return {"job_id": job_id, "cache_hit": True, "report": report}
+    job_id = _enqueue_job(
+        "video_analyze",
+        video_analyze_job,
+        (
+            asset_id,
+            rubric_name,
+            target_preset,
+            captions_srt,
+            captions_vtt,
+            words_json,
+            brand_kit_id,
+            position,
+            font_size,
+            padding_px,
+            max_chars,
+            max_lines,
+            max_words,
+            safe_zone_bottom_px,
+            safe_zone_top_px,
+            cache_key,
+        ),
+        cache_key=cache_key,
+        priority=priority,
+        job_timeout=settings.ffmpeg_timeout_seconds,
+    )
+    return {"job_id": job_id, "cache_hit": False}
+
+
+async def tool_asset_compare(
+    asset_ids: list[str],
+    rubric_name: str,
+    target_preset: str | None = None,
+    priority: str | None = None,
+) -> dict:
+    if not asset_ids:
+        raise ValueError("asset_ids is required")
+    if len(asset_ids) > settings.max_batch_assets:
+        raise ValueError("Too many assets to compare")
+    for asset_id in asset_ids:
+        if not get_asset(asset_id):
+            raise ValueError("asset_id not found")
+    if not rubric_name:
+        raise ValueError("rubric_name is required")
+    describe_rubric(rubric_name)
+    if target_preset:
+        get_preset(target_preset)
+
+    cache_key = _build_cache_key(
+        "asset_compare",
+        {
+            "asset_ids": asset_ids,
+            "rubric_name": rubric_name,
+            "target_preset": target_preset,
+        },
+    )
+    cached_payload = _resolve_cached_payload(cache_key)
+    if cached_payload and cached_payload.get("ranking"):
+        ranking = cached_payload.get("ranking")
+        output_ids = cached_payload.get("output_asset_ids") or []
+        job_id = _record_cached_job(
+            "asset_compare",
+            asset_ids[0],
+            list(output_ids),
+            cache_key,
+            extra={"ranking": ranking},
+        )
+        return {"job_id": job_id, "cache_hit": True, "ranking": ranking}
+    job_id = _enqueue_job(
+        "asset_compare",
+        asset_compare_job,
+        (asset_ids, rubric_name, target_preset, cache_key),
+        cache_key=cache_key,
+        priority=priority,
+        job_timeout=settings.batch_timeout_seconds(),
     )
     return {"job_id": job_id, "cache_hit": False}
 
@@ -1236,6 +1499,7 @@ async def tool_template_apply(
     template_name: str,
     variables: dict | None = None,
     brand_kit_id: str | None = None,
+    quality: str | None = None,
     priority: str | None = None,
 ) -> dict:
     if not get_asset(asset_id):
@@ -1247,6 +1511,10 @@ async def tool_template_apply(
     if brand_kit_id:
         if not get_brand_kit(brand_kit_id):
             raise ValueError("brand_kit_id not found")
+    if quality:
+        quality = quality.strip().lower()
+        if quality not in {"final", "draft"}:
+            raise ValueError("quality must be 'final' or 'draft'")
 
     cache_key = _build_cache_key(
         "template_apply",
@@ -1255,6 +1523,7 @@ async def tool_template_apply(
             "template_name": template_name,
             "variables": variables or {},
             "brand_kit_id": brand_kit_id,
+            "quality": quality,
         },
     )
     cached_outputs = _resolve_cached_outputs(cache_key)
@@ -1264,7 +1533,7 @@ async def tool_template_apply(
     job_id = _enqueue_job(
         "template_apply",
         template_apply_job,
-        (asset_id, template_name, variables or {}, brand_kit_id, cache_key),
+        (asset_id, template_name, variables or {}, brand_kit_id, quality, cache_key),
         cache_key=cache_key,
         priority=priority,
         job_timeout=settings.template_timeout_seconds(),
@@ -1397,6 +1666,7 @@ async def tool_campaign_process(
     template_name: str | None = None,
     variables: dict | None = None,
     brand_kit_id: str | None = None,
+    quality: str | None = None,
     priority: str | None = None,
 ) -> dict:
     if not asset_ids:
@@ -1413,6 +1683,11 @@ async def tool_campaign_process(
     if brand_kit_id and not get_brand_kit(brand_kit_id):
         raise ValueError("brand_kit_id not found")
 
+    if quality:
+        quality = quality.strip().lower()
+        if quality not in {"final", "draft"}:
+            raise ValueError("quality must be 'final' or 'draft'")
+
     cache_key = _build_cache_key(
         "campaign_process",
         {
@@ -1421,6 +1696,7 @@ async def tool_campaign_process(
             "template_name": template_name,
             "variables": variables or {},
             "brand_kit_id": brand_kit_id,
+            "quality": quality,
         },
     )
     cached_outputs = _resolve_cached_outputs(cache_key)
@@ -1430,7 +1706,761 @@ async def tool_campaign_process(
     job_id = _enqueue_job(
         "campaign_process",
         campaign_process_job,
-        (asset_ids, presets, template_name, variables or {}, brand_kit_id, cache_key),
+        (asset_ids, presets, template_name, variables or {}, brand_kit_id, quality, cache_key),
+        cache_key=cache_key,
+        priority=priority,
+        job_timeout=settings.batch_timeout_seconds(),
+    )
+    return {"job_id": job_id, "cache_hit": False}
+
+
+async def tool_render_social_ad(
+    primary_asset_id: str,
+    hook: str | None = None,
+    headline: str | None = None,
+    cta: str | None = None,
+    price: str | None = None,
+    brand_kit_id: str | None = None,
+    broll_asset_ids: list[str] | None = None,
+    voice_asset_id: str | None = None,
+    music_asset_id: str | None = None,
+    captions_srt: str | None = None,
+    captions_vtt: str | None = None,
+    words_json: list[dict] | None = None,
+    highlight_mode: str | None = None,
+    include_16_9: bool | None = None,
+    quality: str | None = None,
+    framing_mode: str | None = None,
+    caption_position: str | None = None,
+    caption_font_size: int | None = None,
+    caption_font_color: str | None = None,
+    caption_box_color: str | None = None,
+    caption_box_opacity: float | None = None,
+    caption_highlight_color: str | None = None,
+    caption_padding_px: int | None = None,
+    caption_max_chars: int | None = None,
+    caption_max_lines: int | None = None,
+    caption_max_words: int | None = None,
+    caption_safe_zone_bottom_px: int | None = None,
+    caption_safe_zone_top_px: int | None = None,
+    caption_font_name: str | None = None,
+    caption_font_asset_id: str | None = None,
+    audio_target_lufs: float | None = None,
+    audio_lra: float | None = None,
+    audio_true_peak: float | None = None,
+    ducking_ratio: float | None = None,
+    ducking_threshold: float | None = None,
+    ducking_attack_ms: int | None = None,
+    ducking_release_ms: int | None = None,
+    music_gain: float | None = None,
+    voice_gain: float | None = None,
+    trim_silence: bool | None = None,
+    trim_silence_min_sec: float | None = None,
+    trim_silence_threshold_db: float | None = None,
+    priority: str | None = None,
+) -> dict:
+    if not get_asset(primary_asset_id):
+        raise ValueError("primary_asset_id not found")
+    if broll_asset_ids is not None and not isinstance(broll_asset_ids, list):
+        raise ValueError("broll_asset_ids must be a list")
+    if broll_asset_ids and len(broll_asset_ids) + 1 > settings.max_concat_clips:
+        raise ValueError("Too many clips for concat")
+    if broll_asset_ids:
+        for asset_id in broll_asset_ids:
+            if not get_asset(asset_id):
+                raise ValueError("broll_asset_id not found")
+    if voice_asset_id and not get_asset(voice_asset_id):
+        raise ValueError("voice_asset_id not found")
+    if music_asset_id and not get_asset(music_asset_id):
+        raise ValueError("music_asset_id not found")
+    if sum(bool(value) for value in [captions_srt, captions_vtt, words_json]) > 1:
+        raise ValueError("Provide only one of captions_srt, captions_vtt, words_json")
+    if words_json is not None and not isinstance(words_json, list):
+        raise ValueError("words_json must be a list")
+    if brand_kit_id and not get_brand_kit(brand_kit_id):
+        raise ValueError("brand_kit_id not found")
+    if quality:
+        quality = quality.strip().lower()
+        if quality not in {"final", "draft"}:
+            raise ValueError("quality must be 'final' or 'draft'")
+    if highlight_mode:
+        highlight_mode = highlight_mode.strip().lower()
+    if framing_mode:
+        framing_mode = framing_mode.strip().lower()
+        if framing_mode not in {"safe_pad", "crop"}:
+            raise ValueError("framing_mode must be 'safe_pad' or 'crop'")
+
+    cache_key = _build_cache_key(
+        "render_social_ad",
+        {
+            "primary_asset_id": primary_asset_id,
+            "hook": hook,
+            "headline": headline,
+            "cta": cta,
+            "price": price,
+            "brand_kit_id": brand_kit_id,
+            "broll_asset_ids": broll_asset_ids or [],
+            "voice_asset_id": voice_asset_id,
+            "music_asset_id": music_asset_id,
+            "captions_srt": captions_srt,
+            "captions_vtt": captions_vtt,
+            "words_json": words_json,
+            "highlight_mode": highlight_mode,
+            "include_16_9": include_16_9,
+            "quality": quality,
+            "framing_mode": framing_mode,
+            "caption_position": caption_position,
+            "caption_font_size": caption_font_size,
+            "caption_font_color": caption_font_color,
+            "caption_box_color": caption_box_color,
+            "caption_box_opacity": caption_box_opacity,
+            "caption_highlight_color": caption_highlight_color,
+            "caption_padding_px": caption_padding_px,
+            "caption_max_chars": caption_max_chars,
+            "caption_max_lines": caption_max_lines,
+            "caption_max_words": caption_max_words,
+            "caption_safe_zone_bottom_px": caption_safe_zone_bottom_px,
+            "caption_safe_zone_top_px": caption_safe_zone_top_px,
+            "caption_font_name": caption_font_name,
+            "caption_font_asset_id": caption_font_asset_id,
+            "audio_target_lufs": audio_target_lufs,
+            "audio_lra": audio_lra,
+            "audio_true_peak": audio_true_peak,
+            "ducking_ratio": ducking_ratio,
+            "ducking_threshold": ducking_threshold,
+            "ducking_attack_ms": ducking_attack_ms,
+            "ducking_release_ms": ducking_release_ms,
+            "music_gain": music_gain,
+            "voice_gain": voice_gain,
+            "trim_silence": trim_silence,
+            "trim_silence_min_sec": trim_silence_min_sec,
+            "trim_silence_threshold_db": trim_silence_threshold_db,
+        },
+    )
+    cached_outputs = _resolve_cached_outputs(cache_key)
+    if cached_outputs:
+        job_id = _record_cached_job("render_social_ad", primary_asset_id, cached_outputs, cache_key)
+        return {"job_id": job_id, "cache_hit": True, "output_asset_ids": cached_outputs}
+    job_id = _enqueue_job(
+        "render_social_ad",
+        render_social_ad_job,
+        (
+            primary_asset_id,
+            hook,
+            headline,
+            cta,
+            price,
+            brand_kit_id,
+            broll_asset_ids or [],
+            voice_asset_id,
+            music_asset_id,
+            captions_srt,
+            captions_vtt,
+            words_json,
+            highlight_mode,
+            include_16_9,
+            quality,
+            framing_mode,
+            caption_position,
+            caption_font_size,
+            caption_font_color,
+            caption_box_color,
+            caption_box_opacity,
+            caption_highlight_color,
+            caption_padding_px,
+            caption_max_chars,
+            caption_max_lines,
+            caption_max_words,
+            caption_safe_zone_bottom_px,
+            caption_safe_zone_top_px,
+            caption_font_name,
+            caption_font_asset_id,
+            audio_target_lufs,
+            audio_lra,
+            audio_true_peak,
+            ducking_ratio,
+            ducking_threshold,
+            ducking_attack_ms,
+            ducking_release_ms,
+            music_gain,
+            voice_gain,
+            trim_silence,
+            trim_silence_min_sec,
+            trim_silence_threshold_db,
+            cache_key,
+        ),
+        cache_key=cache_key,
+        priority=priority,
+        job_timeout=settings.batch_timeout_seconds(),
+    )
+    return {"job_id": job_id, "cache_hit": False}
+
+
+async def tool_render_testimonial_clip(
+    primary_asset_id: str,
+    quote: str | None = None,
+    author: str | None = None,
+    brand_kit_id: str | None = None,
+    broll_asset_ids: list[str] | None = None,
+    voice_asset_id: str | None = None,
+    music_asset_id: str | None = None,
+    captions_srt: str | None = None,
+    captions_vtt: str | None = None,
+    words_json: list[dict] | None = None,
+    highlight_mode: str | None = None,
+    include_16_9: bool | None = None,
+    quality: str | None = None,
+    framing_mode: str | None = None,
+    caption_position: str | None = None,
+    caption_font_size: int | None = None,
+    caption_font_color: str | None = None,
+    caption_box_color: str | None = None,
+    caption_box_opacity: float | None = None,
+    caption_highlight_color: str | None = None,
+    caption_padding_px: int | None = None,
+    caption_max_chars: int | None = None,
+    caption_max_lines: int | None = None,
+    caption_max_words: int | None = None,
+    caption_safe_zone_bottom_px: int | None = None,
+    caption_safe_zone_top_px: int | None = None,
+    caption_font_name: str | None = None,
+    caption_font_asset_id: str | None = None,
+    audio_target_lufs: float | None = None,
+    audio_lra: float | None = None,
+    audio_true_peak: float | None = None,
+    ducking_ratio: float | None = None,
+    ducking_threshold: float | None = None,
+    ducking_attack_ms: int | None = None,
+    ducking_release_ms: int | None = None,
+    music_gain: float | None = None,
+    voice_gain: float | None = None,
+    trim_silence: bool | None = None,
+    trim_silence_min_sec: float | None = None,
+    trim_silence_threshold_db: float | None = None,
+    priority: str | None = None,
+) -> dict:
+    if not get_asset(primary_asset_id):
+        raise ValueError("primary_asset_id not found")
+    if broll_asset_ids is not None and not isinstance(broll_asset_ids, list):
+        raise ValueError("broll_asset_ids must be a list")
+    if broll_asset_ids and len(broll_asset_ids) + 1 > settings.max_concat_clips:
+        raise ValueError("Too many clips for concat")
+    if broll_asset_ids:
+        for asset_id in broll_asset_ids:
+            if not get_asset(asset_id):
+                raise ValueError("broll_asset_id not found")
+    if voice_asset_id and not get_asset(voice_asset_id):
+        raise ValueError("voice_asset_id not found")
+    if music_asset_id and not get_asset(music_asset_id):
+        raise ValueError("music_asset_id not found")
+    if sum(bool(value) for value in [captions_srt, captions_vtt, words_json]) > 1:
+        raise ValueError("Provide only one of captions_srt, captions_vtt, words_json")
+    if words_json is not None and not isinstance(words_json, list):
+        raise ValueError("words_json must be a list")
+    if brand_kit_id and not get_brand_kit(brand_kit_id):
+        raise ValueError("brand_kit_id not found")
+    if quality:
+        quality = quality.strip().lower()
+        if quality not in {"final", "draft"}:
+            raise ValueError("quality must be 'final' or 'draft'")
+    if highlight_mode:
+        highlight_mode = highlight_mode.strip().lower()
+    if framing_mode:
+        framing_mode = framing_mode.strip().lower()
+        if framing_mode not in {"safe_pad", "crop"}:
+            raise ValueError("framing_mode must be 'safe_pad' or 'crop'")
+
+    cache_key = _build_cache_key(
+        "render_testimonial_clip",
+        {
+            "primary_asset_id": primary_asset_id,
+            "quote": quote,
+            "author": author,
+            "brand_kit_id": brand_kit_id,
+            "broll_asset_ids": broll_asset_ids or [],
+            "voice_asset_id": voice_asset_id,
+            "music_asset_id": music_asset_id,
+            "captions_srt": captions_srt,
+            "captions_vtt": captions_vtt,
+            "words_json": words_json,
+            "highlight_mode": highlight_mode,
+            "include_16_9": include_16_9,
+            "quality": quality,
+            "framing_mode": framing_mode,
+            "caption_position": caption_position,
+            "caption_font_size": caption_font_size,
+            "caption_font_color": caption_font_color,
+            "caption_box_color": caption_box_color,
+            "caption_box_opacity": caption_box_opacity,
+            "caption_highlight_color": caption_highlight_color,
+            "caption_padding_px": caption_padding_px,
+            "caption_max_chars": caption_max_chars,
+            "caption_max_lines": caption_max_lines,
+            "caption_max_words": caption_max_words,
+            "caption_safe_zone_bottom_px": caption_safe_zone_bottom_px,
+            "caption_safe_zone_top_px": caption_safe_zone_top_px,
+            "caption_font_name": caption_font_name,
+            "caption_font_asset_id": caption_font_asset_id,
+            "audio_target_lufs": audio_target_lufs,
+            "audio_lra": audio_lra,
+            "audio_true_peak": audio_true_peak,
+            "ducking_ratio": ducking_ratio,
+            "ducking_threshold": ducking_threshold,
+            "ducking_attack_ms": ducking_attack_ms,
+            "ducking_release_ms": ducking_release_ms,
+            "music_gain": music_gain,
+            "voice_gain": voice_gain,
+            "trim_silence": trim_silence,
+            "trim_silence_min_sec": trim_silence_min_sec,
+            "trim_silence_threshold_db": trim_silence_threshold_db,
+        },
+    )
+    cached_outputs = _resolve_cached_outputs(cache_key)
+    if cached_outputs:
+        job_id = _record_cached_job("render_testimonial_clip", primary_asset_id, cached_outputs, cache_key)
+        return {"job_id": job_id, "cache_hit": True, "output_asset_ids": cached_outputs}
+    job_id = _enqueue_job(
+        "render_testimonial_clip",
+        render_testimonial_clip_job,
+        (
+            primary_asset_id,
+            quote,
+            author,
+            brand_kit_id,
+            broll_asset_ids or [],
+            voice_asset_id,
+            music_asset_id,
+            captions_srt,
+            captions_vtt,
+            words_json,
+            highlight_mode,
+            include_16_9,
+            quality,
+            framing_mode,
+            caption_position,
+            caption_font_size,
+            caption_font_color,
+            caption_box_color,
+            caption_box_opacity,
+            caption_highlight_color,
+            caption_padding_px,
+            caption_max_chars,
+            caption_max_lines,
+            caption_max_words,
+            caption_safe_zone_bottom_px,
+            caption_safe_zone_top_px,
+            caption_font_name,
+            caption_font_asset_id,
+            audio_target_lufs,
+            audio_lra,
+            audio_true_peak,
+            ducking_ratio,
+            ducking_threshold,
+            ducking_attack_ms,
+            ducking_release_ms,
+            music_gain,
+            voice_gain,
+            trim_silence,
+            trim_silence_min_sec,
+            trim_silence_threshold_db,
+            cache_key,
+        ),
+        cache_key=cache_key,
+        priority=priority,
+        job_timeout=settings.batch_timeout_seconds(),
+    )
+    return {"job_id": job_id, "cache_hit": False}
+
+
+async def tool_render_offer_card(
+    primary_asset_id: str,
+    headline: str | None = None,
+    price: str | None = None,
+    cta: str | None = None,
+    brand_kit_id: str | None = None,
+    broll_asset_ids: list[str] | None = None,
+    voice_asset_id: str | None = None,
+    music_asset_id: str | None = None,
+    captions_srt: str | None = None,
+    captions_vtt: str | None = None,
+    words_json: list[dict] | None = None,
+    highlight_mode: str | None = None,
+    include_16_9: bool | None = None,
+    quality: str | None = None,
+    framing_mode: str | None = None,
+    caption_position: str | None = None,
+    caption_font_size: int | None = None,
+    caption_font_color: str | None = None,
+    caption_box_color: str | None = None,
+    caption_box_opacity: float | None = None,
+    caption_highlight_color: str | None = None,
+    caption_padding_px: int | None = None,
+    caption_max_chars: int | None = None,
+    caption_max_lines: int | None = None,
+    caption_max_words: int | None = None,
+    caption_safe_zone_bottom_px: int | None = None,
+    caption_safe_zone_top_px: int | None = None,
+    caption_font_name: str | None = None,
+    caption_font_asset_id: str | None = None,
+    audio_target_lufs: float | None = None,
+    audio_lra: float | None = None,
+    audio_true_peak: float | None = None,
+    ducking_ratio: float | None = None,
+    ducking_threshold: float | None = None,
+    ducking_attack_ms: int | None = None,
+    ducking_release_ms: int | None = None,
+    music_gain: float | None = None,
+    voice_gain: float | None = None,
+    trim_silence: bool | None = None,
+    trim_silence_min_sec: float | None = None,
+    trim_silence_threshold_db: float | None = None,
+    priority: str | None = None,
+) -> dict:
+    if not get_asset(primary_asset_id):
+        raise ValueError("primary_asset_id not found")
+    if broll_asset_ids is not None and not isinstance(broll_asset_ids, list):
+        raise ValueError("broll_asset_ids must be a list")
+    if broll_asset_ids and len(broll_asset_ids) + 1 > settings.max_concat_clips:
+        raise ValueError("Too many clips for concat")
+    if broll_asset_ids:
+        for asset_id in broll_asset_ids:
+            if not get_asset(asset_id):
+                raise ValueError("broll_asset_id not found")
+    if voice_asset_id and not get_asset(voice_asset_id):
+        raise ValueError("voice_asset_id not found")
+    if music_asset_id and not get_asset(music_asset_id):
+        raise ValueError("music_asset_id not found")
+    if sum(bool(value) for value in [captions_srt, captions_vtt, words_json]) > 1:
+        raise ValueError("Provide only one of captions_srt, captions_vtt, words_json")
+    if words_json is not None and not isinstance(words_json, list):
+        raise ValueError("words_json must be a list")
+    if brand_kit_id and not get_brand_kit(brand_kit_id):
+        raise ValueError("brand_kit_id not found")
+    if quality:
+        quality = quality.strip().lower()
+        if quality not in {"final", "draft"}:
+            raise ValueError("quality must be 'final' or 'draft'")
+    if highlight_mode:
+        highlight_mode = highlight_mode.strip().lower()
+    if framing_mode:
+        framing_mode = framing_mode.strip().lower()
+        if framing_mode not in {"safe_pad", "crop"}:
+            raise ValueError("framing_mode must be 'safe_pad' or 'crop'")
+
+    cache_key = _build_cache_key(
+        "render_offer_card",
+        {
+            "primary_asset_id": primary_asset_id,
+            "headline": headline,
+            "price": price,
+            "cta": cta,
+            "brand_kit_id": brand_kit_id,
+            "broll_asset_ids": broll_asset_ids or [],
+            "voice_asset_id": voice_asset_id,
+            "music_asset_id": music_asset_id,
+            "captions_srt": captions_srt,
+            "captions_vtt": captions_vtt,
+            "words_json": words_json,
+            "highlight_mode": highlight_mode,
+            "include_16_9": include_16_9,
+            "quality": quality,
+            "framing_mode": framing_mode,
+            "caption_position": caption_position,
+            "caption_font_size": caption_font_size,
+            "caption_font_color": caption_font_color,
+            "caption_box_color": caption_box_color,
+            "caption_box_opacity": caption_box_opacity,
+            "caption_highlight_color": caption_highlight_color,
+            "caption_padding_px": caption_padding_px,
+            "caption_max_chars": caption_max_chars,
+            "caption_max_lines": caption_max_lines,
+            "caption_max_words": caption_max_words,
+            "caption_safe_zone_bottom_px": caption_safe_zone_bottom_px,
+            "caption_safe_zone_top_px": caption_safe_zone_top_px,
+            "caption_font_name": caption_font_name,
+            "caption_font_asset_id": caption_font_asset_id,
+            "audio_target_lufs": audio_target_lufs,
+            "audio_lra": audio_lra,
+            "audio_true_peak": audio_true_peak,
+            "ducking_ratio": ducking_ratio,
+            "ducking_threshold": ducking_threshold,
+            "ducking_attack_ms": ducking_attack_ms,
+            "ducking_release_ms": ducking_release_ms,
+            "music_gain": music_gain,
+            "voice_gain": voice_gain,
+            "trim_silence": trim_silence,
+            "trim_silence_min_sec": trim_silence_min_sec,
+            "trim_silence_threshold_db": trim_silence_threshold_db,
+        },
+    )
+    cached_outputs = _resolve_cached_outputs(cache_key)
+    if cached_outputs:
+        job_id = _record_cached_job("render_offer_card", primary_asset_id, cached_outputs, cache_key)
+        return {"job_id": job_id, "cache_hit": True, "output_asset_ids": cached_outputs}
+    job_id = _enqueue_job(
+        "render_offer_card",
+        render_offer_card_job,
+        (
+            primary_asset_id,
+            headline,
+            price,
+            cta,
+            brand_kit_id,
+            broll_asset_ids or [],
+            voice_asset_id,
+            music_asset_id,
+            captions_srt,
+            captions_vtt,
+            words_json,
+            highlight_mode,
+            include_16_9,
+            quality,
+            framing_mode,
+            caption_position,
+            caption_font_size,
+            caption_font_color,
+            caption_box_color,
+            caption_box_opacity,
+            caption_highlight_color,
+            caption_padding_px,
+            caption_max_chars,
+            caption_max_lines,
+            caption_max_words,
+            caption_safe_zone_bottom_px,
+            caption_safe_zone_top_px,
+            caption_font_name,
+            caption_font_asset_id,
+            audio_target_lufs,
+            audio_lra,
+            audio_true_peak,
+            ducking_ratio,
+            ducking_threshold,
+            ducking_attack_ms,
+            ducking_release_ms,
+            music_gain,
+            voice_gain,
+            trim_silence,
+            trim_silence_min_sec,
+            trim_silence_threshold_db,
+            cache_key,
+        ),
+        cache_key=cache_key,
+        priority=priority,
+        job_timeout=settings.batch_timeout_seconds(),
+    )
+    return {"job_id": job_id, "cache_hit": False}
+
+
+async def tool_render_iterate(
+    render_type: str,
+    primary_asset_id: str,
+    hook: str | None = None,
+    headline: str | None = None,
+    cta: str | None = None,
+    price: str | None = None,
+    quote: str | None = None,
+    author: str | None = None,
+    brand_kit_id: str | None = None,
+    broll_asset_ids: list[str] | None = None,
+    voice_asset_id: str | None = None,
+    music_asset_id: str | None = None,
+    captions_srt: str | None = None,
+    captions_vtt: str | None = None,
+    words_json: list[dict] | None = None,
+    highlight_mode: str | None = None,
+    include_16_9: bool | None = None,
+    quality: str | None = None,
+    framing_mode: str | None = None,
+    caption_position: str | None = None,
+    caption_font_size: int | None = None,
+    caption_font_color: str | None = None,
+    caption_box_color: str | None = None,
+    caption_box_opacity: float | None = None,
+    caption_highlight_color: str | None = None,
+    caption_padding_px: int | None = None,
+    caption_max_chars: int | None = None,
+    caption_max_lines: int | None = None,
+    caption_max_words: int | None = None,
+    caption_safe_zone_bottom_px: int | None = None,
+    caption_safe_zone_top_px: int | None = None,
+    caption_font_name: str | None = None,
+    caption_font_asset_id: str | None = None,
+    audio_target_lufs: float | None = None,
+    audio_lra: float | None = None,
+    audio_true_peak: float | None = None,
+    ducking_ratio: float | None = None,
+    ducking_threshold: float | None = None,
+    ducking_attack_ms: int | None = None,
+    ducking_release_ms: int | None = None,
+    music_gain: float | None = None,
+    voice_gain: float | None = None,
+    trim_silence: bool | None = None,
+    trim_silence_min_sec: float | None = None,
+    trim_silence_threshold_db: float | None = None,
+    rubric_name: str | None = None,
+    pass_threshold: float | None = None,
+    max_iterations: int | None = None,
+    priority: str | None = None,
+) -> dict:
+    if not render_type:
+        raise ValueError("render_type is required")
+    render_type = render_type.strip().lower()
+    if render_type not in {"social_ad", "testimonial_clip", "offer_card"}:
+        raise ValueError("render_type must be social_ad, testimonial_clip, or offer_card")
+    if not get_asset(primary_asset_id):
+        raise ValueError("primary_asset_id not found")
+    if broll_asset_ids is not None and not isinstance(broll_asset_ids, list):
+        raise ValueError("broll_asset_ids must be a list")
+    if broll_asset_ids and len(broll_asset_ids) + 1 > settings.max_concat_clips:
+        raise ValueError("Too many clips for concat")
+    if broll_asset_ids:
+        for asset_id in broll_asset_ids:
+            if not get_asset(asset_id):
+                raise ValueError("broll_asset_id not found")
+    if voice_asset_id and not get_asset(voice_asset_id):
+        raise ValueError("voice_asset_id not found")
+    if music_asset_id and not get_asset(music_asset_id):
+        raise ValueError("music_asset_id not found")
+    if sum(bool(value) for value in [captions_srt, captions_vtt, words_json]) > 1:
+        raise ValueError("Provide only one of captions_srt, captions_vtt, words_json")
+    if words_json is not None and not isinstance(words_json, list):
+        raise ValueError("words_json must be a list")
+    if brand_kit_id and not get_brand_kit(brand_kit_id):
+        raise ValueError("brand_kit_id not found")
+    if quality:
+        quality = quality.strip().lower()
+        if quality not in {"final", "draft"}:
+            raise ValueError("quality must be 'final' or 'draft'")
+    if highlight_mode:
+        highlight_mode = highlight_mode.strip().lower()
+    if framing_mode:
+        framing_mode = framing_mode.strip().lower()
+        if framing_mode not in {"safe_pad", "crop"}:
+            raise ValueError("framing_mode must be 'safe_pad' or 'crop'")
+    if rubric_name:
+        describe_rubric(rubric_name)
+    if max_iterations is not None and int(max_iterations) <= 0:
+        raise ValueError("max_iterations must be > 0")
+
+    cache_key = _build_cache_key(
+        "render_iterate",
+        {
+            "render_type": render_type,
+            "primary_asset_id": primary_asset_id,
+            "hook": hook,
+            "headline": headline,
+            "cta": cta,
+            "price": price,
+            "quote": quote,
+            "author": author,
+            "brand_kit_id": brand_kit_id,
+            "broll_asset_ids": broll_asset_ids or [],
+            "voice_asset_id": voice_asset_id,
+            "music_asset_id": music_asset_id,
+            "captions_srt": captions_srt,
+            "captions_vtt": captions_vtt,
+            "words_json": words_json,
+            "highlight_mode": highlight_mode,
+            "include_16_9": include_16_9,
+            "quality": quality,
+            "framing_mode": framing_mode,
+            "caption_position": caption_position,
+            "caption_font_size": caption_font_size,
+            "caption_font_color": caption_font_color,
+            "caption_box_color": caption_box_color,
+            "caption_box_opacity": caption_box_opacity,
+            "caption_highlight_color": caption_highlight_color,
+            "caption_padding_px": caption_padding_px,
+            "caption_max_chars": caption_max_chars,
+            "caption_max_lines": caption_max_lines,
+            "caption_max_words": caption_max_words,
+            "caption_safe_zone_bottom_px": caption_safe_zone_bottom_px,
+            "caption_safe_zone_top_px": caption_safe_zone_top_px,
+            "caption_font_name": caption_font_name,
+            "caption_font_asset_id": caption_font_asset_id,
+            "audio_target_lufs": audio_target_lufs,
+            "audio_lra": audio_lra,
+            "audio_true_peak": audio_true_peak,
+            "ducking_ratio": ducking_ratio,
+            "ducking_threshold": ducking_threshold,
+            "ducking_attack_ms": ducking_attack_ms,
+            "ducking_release_ms": ducking_release_ms,
+            "music_gain": music_gain,
+            "voice_gain": voice_gain,
+            "trim_silence": trim_silence,
+            "trim_silence_min_sec": trim_silence_min_sec,
+            "trim_silence_threshold_db": trim_silence_threshold_db,
+            "rubric_name": rubric_name,
+            "pass_threshold": pass_threshold,
+            "max_iterations": max_iterations,
+        },
+    )
+    cached_payload = _resolve_cached_payload(cache_key)
+    if cached_payload and cached_payload.get("result"):
+        result = cached_payload.get("result")
+        output_ids = cached_payload.get("output_asset_ids") or []
+        job_id = _record_cached_job(
+            "render_iterate",
+            primary_asset_id,
+            list(output_ids),
+            cache_key,
+            extra={"result": result},
+        )
+        return {"job_id": job_id, "cache_hit": True, "result": result}
+    job_id = _enqueue_job(
+        "render_iterate",
+        render_iterate_job,
+        (
+            render_type,
+            primary_asset_id,
+            hook,
+            headline,
+            cta,
+            price,
+            quote,
+            author,
+            brand_kit_id,
+            broll_asset_ids or [],
+            voice_asset_id,
+            music_asset_id,
+            captions_srt,
+            captions_vtt,
+            words_json,
+            highlight_mode,
+            include_16_9,
+            quality,
+            framing_mode,
+            caption_position,
+            caption_font_size,
+            caption_font_color,
+            caption_box_color,
+            caption_box_opacity,
+            caption_highlight_color,
+            caption_padding_px,
+            caption_max_chars,
+            caption_max_lines,
+            caption_max_words,
+            caption_safe_zone_bottom_px,
+            caption_safe_zone_top_px,
+            caption_font_name,
+            caption_font_asset_id,
+            audio_target_lufs,
+            audio_lra,
+            audio_true_peak,
+            ducking_ratio,
+            ducking_threshold,
+            ducking_attack_ms,
+            ducking_release_ms,
+            music_gain,
+            voice_gain,
+            trim_silence,
+            trim_silence_min_sec,
+            trim_silence_threshold_db,
+            rubric_name,
+            pass_threshold,
+            max_iterations,
+            cache_key,
+        ),
         cache_key=cache_key,
         priority=priority,
         job_timeout=settings.batch_timeout_seconds(),
@@ -1467,9 +2497,20 @@ async def tool_describe_preset(name: str) -> dict:
     return {"preset": describe_preset(name)}
 
 
+async def tool_rubric_list() -> dict:
+    return {"rubrics": list_rubrics()}
+
+
+async def tool_rubric_describe(name: str) -> dict:
+    if not name:
+        raise ValueError("rubric name is required")
+    return {"rubric": describe_rubric(name)}
+
+
 async def tool_capabilities() -> dict:
     presets = list_presets()
     templates = list_templates()
+    rubrics = list_rubrics()
     output_containers = sorted(
         {preset.get("output_container") for preset in presets if preset.get("output_container")}
     )
@@ -1514,6 +2555,28 @@ async def tool_capabilities() -> dict:
             "max_workflow_nodes": settings.max_workflow_nodes,
             "max_batch_assets": settings.max_batch_assets,
             "max_batch_presets": settings.max_batch_presets,
+            "max_caption_segments": settings.max_caption_segments,
+            "caption_max_chars": settings.caption_max_chars,
+            "caption_max_lines": settings.caption_max_lines,
+            "caption_max_words": settings.caption_max_words,
+            "caption_line_spacing": settings.caption_line_spacing,
+            "caption_font_size": settings.caption_font_size,
+            "caption_position": settings.caption_position,
+            "caption_text_color": settings.caption_text_color,
+            "caption_box_color": settings.caption_box_color,
+            "caption_box_opacity": settings.caption_box_opacity,
+            "caption_highlight_color": settings.caption_highlight_color,
+            "caption_padding_px": settings.caption_padding_px,
+            "caption_safe_zone_bottom_px": settings.caption_safe_zone_bottom_px,
+            "caption_safe_zone_top_px": settings.caption_safe_zone_top_px,
+            "draft_max_dimension": settings.draft_max_dimension,
+            "draft_crf": settings.draft_crf,
+            "draft_preset": settings.draft_preset,
+            "draft_audio_bitrate": settings.draft_audio_bitrate,
+            "draft_watermark_enabled": settings.draft_watermark_enabled,
+            "draft_watermark_text": settings.draft_watermark_text,
+            "draft_watermark_opacity": settings.draft_watermark_opacity,
+            "draft_watermark_font_size": settings.draft_watermark_font_size,
             "audio_norm_i": settings.audio_norm_i,
             "audio_norm_lra": settings.audio_norm_lra,
             "audio_norm_tp": settings.audio_norm_tp,
@@ -1550,8 +2613,71 @@ async def tool_capabilities() -> dict:
         "output_containers": output_containers,
         "presets": presets,
         "templates": templates,
+        "rubrics": rubrics,
         "social_presets": settings.social_presets,
     }
+
+
+async def tool_job_progress(job_id: str) -> dict:
+    if not job_id:
+        raise ValueError("job_id is required")
+    job_record = get_job(job_id) or {}
+    if not job_record:
+        return {
+            "job_id": job_id,
+            "status": "unknown",
+            "phase": "unknown",
+            "progress_pct": None,
+        }
+
+    synced = _sync_job_status(job_id, job_record)
+    status = synced.get("status") or "unknown"
+    progress = synced.get("progress")
+    if progress is None:
+        progress = 0 if status == "queued" else 50 if status == "running" else 100
+    return {
+        "job_id": job_id,
+        "status": status,
+        "phase": status,
+        "progress_pct": progress,
+    }
+
+
+async def tool_job_logs(job_id: str) -> dict:
+    if not job_id:
+        raise ValueError("job_id is required")
+    job_record = get_job(job_id) or {}
+    if not job_record:
+        return {
+            "job_id": job_id,
+            "status": "unknown",
+            "logs_short": None,
+            "last_log_line": None,
+            "error": None,
+        }
+
+    synced = _sync_job_status(job_id, job_record)
+    logs_short = synced.get("logs_short")
+    return {
+        "job_id": job_id,
+        "status": synced.get("status"),
+        "logs_short": logs_short,
+        "last_log_line": _last_log_line(logs_short),
+        "error": synced.get("error"),
+    }
+
+
+async def tool_metrics_snapshot() -> dict:
+    queue_depth: dict[str, int] = {}
+    for name in settings.queue_names():
+        queue = Queue(name, connection=get_redis())
+        depth = queue.count
+        if callable(depth):
+            depth = depth()
+        queue_depth[name] = int(depth)
+    snapshot = collect_metrics_snapshot()
+    snapshot["queue_depth"] = queue_depth
+    return snapshot
 
 
 async def tool_job_status(job_id: str) -> dict:
@@ -1586,6 +2712,9 @@ async def tool_job_status(job_id: str) -> dict:
         "progress": progress,
         "progress_pct": progress,
         "output_asset_ids": synced.get("output_asset_ids"),
+        "report": synced.get("report"),
+        "ranking": synced.get("ranking"),
+        "result": synced.get("result"),
         "error": error,
         "logs_short": logs_short,
         "last_log_line": _last_log_line(logs_short),
@@ -1699,6 +2828,9 @@ TOOL_REGISTRY = {
     "ffmpeg_trim": tool_trim,
     "video_add_text": tool_video_add_text,
     "video_add_logo": tool_video_add_logo,
+    "captions_burn_in": tool_captions_burn_in,
+    "video_analyze": tool_video_analyze,
+    "asset_compare": tool_asset_compare,
     "video_concat": tool_video_concat,
     "image_to_video": tool_image_to_video,
     "images_to_slideshow": tool_images_to_slideshow,
@@ -1720,11 +2852,20 @@ TOOL_REGISTRY = {
     "batch_export_formats": tool_batch_export_formats,
     "batch_export_social_formats": tool_batch_export_social_formats,
     "campaign_process": tool_campaign_process,
+    "render_social_ad": tool_render_social_ad,
+    "render_testimonial_clip": tool_render_testimonial_clip,
+    "render_offer_card": tool_render_offer_card,
+    "render_iterate": tool_render_iterate,
     "workflow_run": tool_workflow_run,
     "ffmpeg_list_presets": tool_list_presets,
     "ffmpeg_describe_preset": tool_describe_preset,
+    "rubric_list": tool_rubric_list,
+    "rubric_describe": tool_rubric_describe,
     "ffmpeg_capabilities": tool_capabilities,
     "job_status": tool_job_status,
+    "job_progress": tool_job_progress,
+    "job_logs": tool_job_logs,
+    "metrics_snapshot": tool_metrics_snapshot,
     "media_get_download_url": tool_get_download_url,
     "media_export_to_drive": tool_export_to_drive,
     "media_export_to_discord": tool_export_to_discord,

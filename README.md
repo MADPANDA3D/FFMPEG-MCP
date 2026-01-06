@@ -10,6 +10,8 @@ download URLs. Built to match the Google/Discord MCP deployment style on VPS.
 - Preset-only FFmpeg operations (no arbitrary flags)
 - Marketing-focused presets (social crops, safe pads, audio normalization, text placeholders)
 - Text + logo overlays (drawtext + watermark) via async jobs
+- Caption burn-in + one-shot marketing render tools
+- Rubrics + analyze/iterate/compare for closed-loop quality
 - Templates + Brand Kits for one-call marketing outputs
 - Batch exports, campaign processing, and workflow chaining
 - Signed download URLs (`/download/{asset_id}`)
@@ -97,7 +99,14 @@ Core video:
 - `ffmpeg_trim`
 - `video_add_text`
 - `video_add_logo`
+- `captions_burn_in`
 - `video_concat`
+
+Analysis + QA:
+- `video_analyze`
+- `asset_compare`
+- `rubric_list`
+- `rubric_describe`
 
 Image to video:
 - `image_to_video`
@@ -127,6 +136,10 @@ Batch + workflow:
 - `batch_export_formats`
 - `batch_export_social_formats`
 - `campaign_process`
+- `render_social_ad`
+- `render_testimonial_clip`
+- `render_offer_card`
+- `render_iterate`
 - `workflow_run`
 
 Meta:
@@ -134,6 +147,9 @@ Meta:
 - `ffmpeg_describe_preset`
 - `ffmpeg_capabilities`
 - `job_status`
+- `job_progress`
+- `job_logs`
+- `metrics_snapshot`
 
 ## Presets
 
@@ -196,12 +212,48 @@ Notes:
 - `logo_key` is resolved from `LOGO_DIR` (and `LOGO_ALLOWLIST` if set).
 - Async tools accept optional `priority` (`urgent`, `batch`, or default) if queues are configured.
 
+## Captions
+
+Burn-in captions (`captions_burn_in`):
+- Required: `asset_id` plus one of `captions_srt`, `captions_vtt`, or `words_json`
+- `words_json` shape: `[{ "word": "Hello", "start": 1.23, "end": 1.56 }]` (seconds)
+- Optional: `brand_kit_id`, `highlight_mode="word"`, `position`, `font_size`, `font_color`,
+  `box_color`, `box_opacity`, `padding_px`, `max_chars`, `max_lines`, `max_words`,
+  `safe_zone_bottom_px`, `safe_zone_top_px`, `font_name`, `font_asset_id`
+
+## Marketing render tools
+
+One-shot renders (captioned + non-captioned variants when captions are supplied):
+- `render_social_ad`
+- `render_testimonial_clip`
+- `render_offer_card`
+- `render_iterate` (render + analyze + auto-tune until rubric threshold)
+
+Defaults:
+- Variants: 9:16 + 1:1 + 4:5 (set `include_16_9=true` for 16:9)
+- Inputs: `primary_asset_id` required; optional `broll_asset_ids`, `voice_asset_id`, `music_asset_id`
+- Quality: `quality=draft|final` (draft uses 720p presets and optional watermark)
+
+Caption inputs: pass `captions_srt`, `captions_vtt`, or `words_json` to generate captioned outputs.
+
+## Analysis + QA
+
+- `video_analyze` returns audio/video/caption metrics with optional rubric scoring.
+- `asset_compare` ranks assets by rubric score.
+- `rubric_list` / `rubric_describe` expose scoring profiles.
+- `job_status` includes `report` (analyze), `ranking` (compare), and `result` (iterate).
+
 ## Templates
 
 List and apply:
 - `template_list`
 - `template_describe`
 - `template_apply`
+
+Notes:
+- `template_describe` returns a schema (required fields, defaults, max chars).
+- `template_apply` accepts `quality=draft|final` to map to draft presets.
+- `campaign_process` accepts `quality=draft|final` to map presets for draft outputs.
 
 Example:
 

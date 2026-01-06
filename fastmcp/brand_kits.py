@@ -7,6 +7,7 @@ from overlay_utils import (
     DEFAULT_TEXT_POSITION,
     LOGO_POSITIONS,
     TEXT_POSITIONS,
+    sanitize_font_size,
     sanitize_color,
     sanitize_opacity,
     sanitize_position,
@@ -30,6 +31,20 @@ ALLOWED_KEYS = {
     "text_position",
     "default_preset",
     "auto_logo",
+    "caption_font_name",
+    "caption_font_asset_id",
+    "caption_font_size",
+    "caption_position",
+    "caption_text_color",
+    "caption_box_color",
+    "caption_box_opacity",
+    "caption_highlight_color",
+    "caption_padding_px",
+    "caption_max_chars",
+    "caption_max_lines",
+    "caption_max_words",
+    "caption_safe_zone_bottom_px",
+    "caption_safe_zone_top_px",
 }
 
 
@@ -97,5 +112,78 @@ def sanitize_brand_kit(payload: dict[str, Any]) -> dict[str, Any]:
         cleaned["auto_logo"] = bool(payload["auto_logo"])
     else:
         cleaned["auto_logo"] = False
+
+    if payload.get("caption_font_name"):
+        cleaned["caption_font_name"] = str(payload["caption_font_name"]).strip()
+    if payload.get("caption_font_asset_id"):
+        cleaned["caption_font_asset_id"] = str(payload["caption_font_asset_id"]).strip()
+    if payload.get("caption_font_size") is not None:
+        cleaned["caption_font_size"] = sanitize_font_size(payload["caption_font_size"], 48)
+    if payload.get("caption_position"):
+        cleaned["caption_position"] = sanitize_position(
+            payload["caption_position"], {"bottom_safe", "mid", "top"}
+        )
+    if payload.get("caption_text_color"):
+        cleaned["caption_text_color"] = sanitize_color(payload["caption_text_color"], "white")
+    if payload.get("caption_box_color"):
+        cleaned["caption_box_color"] = sanitize_color(payload["caption_box_color"], "black")
+    if payload.get("caption_box_opacity") is not None:
+        try:
+            opacity = float(payload["caption_box_opacity"])
+        except (TypeError, ValueError):
+            raise ValueError("caption_box_opacity must be a number") from None
+        if opacity < 0 or opacity > 1:
+            raise ValueError("caption_box_opacity must be between 0 and 1")
+        cleaned["caption_box_opacity"] = opacity
+    if payload.get("caption_highlight_color"):
+        cleaned["caption_highlight_color"] = sanitize_color(payload["caption_highlight_color"], "yellow")
+    if payload.get("caption_padding_px") is not None:
+        try:
+            padding = int(payload["caption_padding_px"])
+        except (TypeError, ValueError):
+            raise ValueError("caption_padding_px must be an integer") from None
+        if padding < 0 or padding > 200:
+            raise ValueError("caption_padding_px out of range")
+        cleaned["caption_padding_px"] = padding
+    if payload.get("caption_max_chars") is not None:
+        try:
+            max_chars = int(payload["caption_max_chars"])
+        except (TypeError, ValueError):
+            raise ValueError("caption_max_chars must be an integer") from None
+        if max_chars <= 0 or max_chars > 200:
+            raise ValueError("caption_max_chars out of range")
+        cleaned["caption_max_chars"] = max_chars
+    if payload.get("caption_max_lines") is not None:
+        try:
+            max_lines = int(payload["caption_max_lines"])
+        except (TypeError, ValueError):
+            raise ValueError("caption_max_lines must be an integer") from None
+        if max_lines <= 0 or max_lines > 6:
+            raise ValueError("caption_max_lines out of range")
+        cleaned["caption_max_lines"] = max_lines
+    if payload.get("caption_max_words") is not None:
+        try:
+            max_words = int(payload["caption_max_words"])
+        except (TypeError, ValueError):
+            raise ValueError("caption_max_words must be an integer") from None
+        if max_words <= 0 or max_words > 30:
+            raise ValueError("caption_max_words out of range")
+        cleaned["caption_max_words"] = max_words
+    if payload.get("caption_safe_zone_bottom_px") is not None:
+        try:
+            bottom_px = int(payload["caption_safe_zone_bottom_px"])
+        except (TypeError, ValueError):
+            raise ValueError("caption_safe_zone_bottom_px must be an integer") from None
+        if bottom_px < 0 or bottom_px > 400:
+            raise ValueError("caption_safe_zone_bottom_px out of range")
+        cleaned["caption_safe_zone_bottom_px"] = bottom_px
+    if payload.get("caption_safe_zone_top_px") is not None:
+        try:
+            top_px = int(payload["caption_safe_zone_top_px"])
+        except (TypeError, ValueError):
+            raise ValueError("caption_safe_zone_top_px must be an integer") from None
+        if top_px < 0 or top_px > 400:
+            raise ValueError("caption_safe_zone_top_px out of range")
+        cleaned["caption_safe_zone_top_px"] = top_px
 
     return cleaned

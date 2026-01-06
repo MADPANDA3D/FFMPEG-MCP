@@ -159,6 +159,20 @@ class Settings:
     max_workflow_nodes: int = _get_int("MAX_WORKFLOW_NODES", 40)
     max_batch_assets: int = _get_int("MAX_BATCH_ASSETS", 50)
     max_batch_presets: int = _get_int("MAX_BATCH_PRESETS", 12)
+    max_caption_segments: int = _get_int("MAX_CAPTION_SEGMENTS", 200)
+    caption_max_chars: int = _get_int("CAPTION_MAX_CHARS", 72)
+    caption_max_lines: int = _get_int("CAPTION_MAX_LINES", 2)
+    caption_max_words: int = _get_int("CAPTION_MAX_WORDS", 10)
+    caption_line_spacing: int = _get_int("CAPTION_LINE_SPACING", 8)
+    caption_font_size: int = _get_int("CAPTION_FONT_SIZE", 48)
+    caption_position: str = _get_env("CAPTION_POSITION", "bottom_safe")
+    caption_text_color: str = _get_env("CAPTION_TEXT_COLOR", "white")
+    caption_box_color: str = _get_env("CAPTION_BOX_COLOR", "black")
+    caption_box_opacity: float = _get_float("CAPTION_BOX_OPACITY", 0.6)
+    caption_highlight_color: str = _get_env("CAPTION_HIGHLIGHT_COLOR", "yellow")
+    caption_padding_px: int = _get_int("CAPTION_PADDING_PX", 24)
+    caption_safe_zone_bottom_px: int = _get_int("CAPTION_SAFE_ZONE_BOTTOM_PX", 96)
+    caption_safe_zone_top_px: int = _get_int("CAPTION_SAFE_ZONE_TOP_PX", 64)
 
     social_presets: list[str] = field(
         default_factory=lambda: _split_csv(
@@ -182,6 +196,15 @@ class Settings:
     ducking_attack_ms: int = _get_int("AUDIO_DUCKING_ATTACK_MS", 20)
     ducking_release_ms: int = _get_int("AUDIO_DUCKING_RELEASE_MS", 200)
     ducking_music_gain: float = _get_float("AUDIO_DUCKING_MUSIC_GAIN", 0.8)
+
+    draft_max_dimension: int = _get_int("DRAFT_MAX_DIMENSION", 720)
+    draft_crf: int = _get_int("DRAFT_CRF", 28)
+    draft_preset: str = _get_env("DRAFT_PRESET", "ultrafast")
+    draft_audio_bitrate: str = _get_env("DRAFT_AUDIO_BITRATE", "96k")
+    draft_watermark_enabled: bool = _get_bool("DRAFT_WATERMARK_ENABLED", False)
+    draft_watermark_text: str = _get_env("DRAFT_WATERMARK_TEXT", "DRAFT")
+    draft_watermark_opacity: float = _get_float("DRAFT_WATERMARK_OPACITY", 0.35)
+    draft_watermark_font_size: int = _get_int("DRAFT_WATERMARK_FONT_SIZE", 48)
 
     queue_name_urgent: str = _get_env("QUEUE_NAME_URGENT", "")
     queue_name_batch: str = _get_env("QUEUE_NAME_BATCH", "")

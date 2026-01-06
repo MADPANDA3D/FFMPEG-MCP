@@ -1,5 +1,7 @@
 import hashlib
+import json
 import os
+import re
 import string
 import tempfile
 import uuid
@@ -7,6 +9,7 @@ from typing import Any
 
 from rq import get_current_job
 
+from captions import parse_captions_input
 from config import settings
 from ffmpeg_utils import FfmpegError, run_ffmpeg
 from ffprobe_utils import run_ffprobe
@@ -33,8 +36,9 @@ from overlay_utils import (
     sanitize_scale_pct,
     sanitize_text,
 )
-from templates import get_template
-from presets import get_preset
+from templates import get_template, validate_template_variables
+from presets import draft_preset_for, get_preset, map_presets_for_quality
+from rubrics import get_rubric, score_report
 from redis_store import (
     build_cache_key,
     delete_cached_result,
@@ -122,6 +126,65 @@ def _resolve_input_path(asset: dict[str, Any]) -> tuple[str, bool]:
     return temp_path, settings.storage_backend == "s3"
 
 
+def _coerce_video_asset_id(asset_id: str) -> str:
+    asset = _get_asset_or_error(asset_id)
+    mime = _asset_mime(asset)
+    if mime.startswith("video/"):
+        return asset_id
+    if mime.startswith("image/"):
+        if not settings.allow_image_ingest:
+            raise JobError("Image ingest is disabled")
+        cache_key = build_cache_key(
+            "ffmpeg:image_to_video",
+            {
+                "asset_id": asset_id,
+                "duration_sec": None,
+                "width": None,
+                "height": None,
+                "fps": None,
+                "background_color": None,
+            },
+        )
+        cached = _resolve_cached_output(cache_key)
+        if cached:
+            return cached
+        output_asset = image_to_video_job(
+            asset_id,
+            None,
+            None,
+            None,
+            None,
+            None,
+            cache_key=cache_key,
+            job_id_override="",
+        )
+        return output_asset["asset_id"]
+    raise JobError("Input asset must be a video or image")
+
+
+def _coerce_audio_asset_id(asset_id: str) -> str:
+    asset = _get_asset_or_error(asset_id)
+    mime = _asset_mime(asset)
+    if mime.startswith("audio/"):
+        return asset_id
+    if mime.startswith("video/"):
+        cache_key = build_cache_key(
+            "ffmpeg:extract_audio",
+            {"asset_id": asset_id, "output_format": "m4a"},
+        )
+        cached = _resolve_cached_output(cache_key)
+        if cached:
+            return cached
+        output_asset = extract_audio_job(
+            asset_id,
+            "m4a",
+            cache_key=cache_key,
+            job_id_override="",
+        )
+        return output_asset["asset_id"]
+    raise JobError("Input asset must be audio or video with audio")
+
+
 def _finish_job(job_id: str, status: str, updates: dict[str, Any]) -> None:
     if not job_id:
         return
@@ -163,6 +226,11 @@ def _ensure_video_asset(asset: dict[str, Any]) -> None:
         raise JobError("Input asset must be a video")
 
 
+def _ensure_audio_asset(asset: dict[str, Any]) -> None:
+    if not _asset_mime(asset).startswith("audio/"):
+        raise JobError("Input asset must be an audio file")
+
+
 def _ensure_image_asset(asset: dict[str, Any]) -> None:
     if not _asset_mime(asset).startswith("image/"):
         raise JobError("Input asset must be an image")
@@ -191,6 +259,9 @@ def _has_video_stream(probe: dict[str, Any]) -> bool:
     return False
 
 
+CAPTION_POSITIONS = {"bottom_safe", "mid", "top"}
+
+
 def _text_overlay_xy(position: str) -> tuple[str, str]:
     margin = max(settings.overlay_margin_px, 0)
     x_expr = "(w-text_w)/2"
@@ -212,6 +283,205 @@ def _logo_overlay_xy(position: str) -> tuple[str, str]:
     if position == "bottom-left":
         return str(margin), f"H-h-{margin}"
     return f"W-w-{margin}", f"H-h-{margin}"
+
+
+def _caption_overlay_xy(position: str, safe_bottom_px: int, safe_top_px: int) -> tuple[str, str]:
+    x_expr = "(w-text_w)/2"
+    if position == "top":
+        y_expr = str(max(safe_top_px, 0))
+    elif position == "mid":
+        y_expr = "(h-text_h)/2"
+    else:
+        y_expr = f"h-text_h-{max(safe_bottom_px, 0)}"
+    return x_expr, y_expr
+
+
+def _apply_opacity(color: str, opacity: float) -> str:
+    if "@" in color:
+        return color
+    opacity = min(max(opacity, 0.0), 1.0)
+    opacity_str = f"{opacity:.3f}".rstrip("0").rstrip(".")
+    return f"{color}@{opacity_str}"
+
+
+def _parse_loudnorm_json(logs: str) -> dict[str, Any] | None:
+    if not logs:
+        return None
+    candidates = re.findall(r"\{[^{}]*\}", logs, flags=re.DOTALL)
+    for raw in reversed(candidates):
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        keys = set(payload.keys())
+        if {"input_i", "input_tp", "input_lra"} & keys or {"measured_I", "measured_TP", "measured_LRA"} & keys:
+            return payload
+    return None
+
+
+def _parse_silencedetect(logs: str, total_duration: float | None) -> float | None:
+    if not logs or not total_duration:
+        return None
+    silence_total = 0.0
+    open_start: float | None = None
+    for line in logs.splitlines():
+        if "silence_start" in line:
+            match = re.search(r"silence_start:\\s*([-\\d\\.]+)", line)
+            if match:
+                try:
+                    open_start = float(match.group(1))
+                except ValueError:
+                    open_start = None
+        if "silence_end" in line:
+            match = re.search(
+                r"silence_end:\\s*([-\\d\\.]+)\\s*\\|\\s*silence_duration:\\s*([-\\d\\.]+)",
+                line,
+            )
+            if match:
+                try:
+                    duration = float(match.group(2))
+                except ValueError:
+                    duration = 0.0
+                silence_total += max(duration, 0.0)
+                open_start = None
+    if open_start is not None and total_duration > open_start:
+        silence_total += total_duration - open_start
+    if total_duration <= 0:
+        return None
+    return round((silence_total / total_duration) * 100.0, 3)
+
+
+def _parse_blackdetect(logs: str, total_duration: float | None) -> float | None:
+    if not logs or not total_duration:
+        return None
+    black_total = 0.0
+    for line in logs.splitlines():
+        if "black_duration" not in line:
+            continue
+        match = re.search(r"black_duration:\\s*([-\\d\\.]+)", line)
+        if match:
+            try:
+                black_total += float(match.group(1))
+            except ValueError:
+                continue
+    if total_duration <= 0:
+        return None
+    return round((black_total / total_duration) * 100.0, 3)
+
+
+def _parse_astats_clipping(logs: str) -> float | None:
+    if not logs:
+        return None
+    samples = 0
+    clipped = 0
+    for line in logs.splitlines():
+        match_samples = re.search(r"Number of samples:\\s*(\\d+)", line)
+        if match_samples:
+            try:
+                samples += int(match_samples.group(1))
+            except ValueError:
+                continue
+        match_clipped = re.search(r"Number of samples clipped:\\s*(\\d+)", line)
+        if match_clipped:
+            try:
+                clipped += int(match_clipped.group(1))
+            except ValueError:
+                continue
+    if samples <= 0:
+        return None
+    return round((clipped / samples) * 100.0, 5)
+
+
+def _expected_dims_from_preset(preset_name: str | None) -> tuple[int | None, int | None]:
+    if not preset_name:
+        return None, None
+    try:
+        preset = get_preset(preset_name)
+    except ValueError:
+        return None, None
+    profile = preset.get("profile") or {}
+    scale = profile.get("scale") or ""
+    match = re.search(r"(\\d+)\\s*:\\s*(\\d+)", str(scale))
+    if match:
+        return int(match.group(1)), int(match.group(2))
+    for arg in preset.get("ffmpeg_args", []):
+        match = re.search(r"(?:scale|pad|crop)=(\\d+):(\\d+)", str(arg))
+        if match:
+            return int(match.group(1)), int(match.group(2))
+    return None, None
+
+
+def _caption_metrics(
+    segments: list[dict[str, Any]],
+    max_chars: int,
+    max_lines: int,
+    max_words: int,
+    position: str,
+    safe_bottom_px: int,
+    safe_top_px: int,
+    padding_px: int,
+    font_size: int,
+    speed_wpm_max: float,
+) -> dict[str, Any]:
+    if not segments:
+        return {
+            "caption_readability_score": None,
+            "caption_speed_score": None,
+            "caption_speed_wpm": None,
+            "safe_zone_violations": None,
+        }
+
+    readability_scores: list[float] = []
+    speed_values: list[float] = []
+    violation_count = 0
+    for seg in segments:
+        text = str(seg.get("text") or "")
+        lines = [line for line in text.split("\\n") if line.strip()]
+        if not lines:
+            continue
+        longest_line = max(len(line) for line in lines)
+        line_usage = longest_line / max_chars if max_chars > 0 else 0
+        lines_usage = len(lines) / max_lines if max_lines > 0 else 0
+        words = len(text.replace("\\n", " ").split())
+        words_usage = words / max_words if max_words > 0 else 0
+
+        score = 100.0
+        if line_usage > 1:
+            score -= (line_usage - 1) * 60
+        if lines_usage > 1:
+            score -= (lines_usage - 1) * 60
+        if words_usage > 1:
+            score -= (words_usage - 1) * 40
+        readability_scores.append(max(0.0, min(100.0, score)))
+
+        duration = float(seg.get("end", 0)) - float(seg.get("start", 0))
+        if duration > 0:
+            wpm = (words / duration) * 60.0
+            speed_values.append(wpm)
+
+        safe_margin_needed = padding_px + int(font_size * 0.6)
+        if position == "bottom_safe" and safe_bottom_px < safe_margin_needed:
+            violation_count += 1
+        if position == "top" and safe_top_px < safe_margin_needed:
+            violation_count += 1
+
+    avg_readability = sum(readability_scores) / len(readability_scores) if readability_scores else None
+    avg_wpm = sum(speed_values) / len(speed_values) if speed_values else None
+    speed_score = None
+    if avg_wpm is not None:
+        if avg_wpm <= speed_wpm_max:
+            speed_score = 100.0
+        else:
+            speed_score = max(0.0, 100.0 - (avg_wpm - speed_wpm_max) * 0.6)
+
+    return {
+        "caption_readability_score": round(avg_readability, 2) if avg_readability is not None else None,
+        "caption_speed_score": round(speed_score, 2) if speed_score is not None else None,
+        "caption_speed_wpm": round(avg_wpm, 2) if avg_wpm is not None else None,
+        "safe_zone_violations": violation_count,
+    }
 
 
 def _audio_output_config(fmt: str, bitrate: str | None) -> tuple[str, list[str], str]:
@@ -782,6 +1052,280 @@ def video_add_text_job(
             os.remove(font_path)
         if text_path and os.path.exists(text_path):
             os.remove(text_path)
+        if os.path.exists(output_path):
+            os.remove(output_path)
+
+
+def captions_burn_in_job(
+    asset_id: str,
+    captions_srt: str | None,
+    captions_vtt: str | None,
+    words_json: list[dict[str, Any]] | None,
+    brand_kit_id: str | None,
+    highlight_mode: str | None,
+    position: str | None,
+    font_size: int | None,
+    font_color: str | None,
+    box_color: str | None,
+    box_opacity: float | None,
+    highlight_color: str | None,
+    padding_px: int | None,
+    max_chars: int | None,
+    max_lines: int | None,
+    max_words: int | None,
+    safe_zone_bottom_px: int | None,
+    safe_zone_top_px: int | None,
+    font_name: str | None,
+    font_asset_id: str | None,
+    cache_key: str | None = None,
+    job_id_override: str | None = None,
+) -> dict[str, Any]:
+    job = get_current_job()
+    job_id = job_id_override if job_id_override is not None else (job.id if job else "")
+    start_ts = job_timer()
+    _log_job_started("captions_burn_in", job_id, asset_id)
+    _finish_job(
+        job_id,
+        "running",
+        {"started_at": utc_now_iso(), "progress": 10, "cache_key": cache_key},
+    )
+
+    if sum(bool(value) for value in [captions_srt, captions_vtt, words_json]) != 1:
+        raise JobError("Provide exactly one of captions_srt, captions_vtt, words_json")
+    if captions_srt is not None and not isinstance(captions_srt, str):
+        raise JobError("captions_srt must be a string")
+    if captions_vtt is not None and not isinstance(captions_vtt, str):
+        raise JobError("captions_vtt must be a string")
+    if words_json is not None and not isinstance(words_json, list):
+        raise JobError("words_json must be a list")
+
+    if highlight_mode:
+        highlight_mode = highlight_mode.strip().lower()
+        if highlight_mode not in {"word"}:
+            raise JobError("highlight_mode must be 'word' or omitted")
+
+    asset = _get_asset_or_error(asset_id)
+    _ensure_video_asset(asset)
+
+    brand_kit = get_brand_kit(brand_kit_id) if brand_kit_id else None
+    if brand_kit_id and not brand_kit:
+        raise JobError("brand_kit_id not found")
+
+    resolved_max_chars = max_chars if max_chars is not None else (
+        brand_kit.get("caption_max_chars") if brand_kit else None
+    )
+    resolved_max_lines = max_lines if max_lines is not None else (
+        brand_kit.get("caption_max_lines") if brand_kit else None
+    )
+    resolved_max_words = max_words if max_words is not None else (
+        brand_kit.get("caption_max_words") if brand_kit else None
+    )
+    resolved_max_chars = int(resolved_max_chars or settings.caption_max_chars)
+    resolved_max_lines = int(resolved_max_lines or settings.caption_max_lines)
+    resolved_max_words = int(resolved_max_words or settings.caption_max_words)
+    if resolved_max_chars <= 0 or resolved_max_lines <= 0 or resolved_max_words <= 0:
+        raise JobError("caption max values must be > 0")
+
+    resolved_position = position if position else (
+        brand_kit.get("caption_position") if brand_kit else None
+    )
+    if not resolved_position:
+        resolved_position = settings.caption_position
+    resolved_position = sanitize_position(resolved_position, CAPTION_POSITIONS)
+
+    resolved_font_size = font_size if font_size is not None else (
+        brand_kit.get("caption_font_size") if brand_kit else None
+    )
+    resolved_font_size = sanitize_font_size(resolved_font_size, settings.caption_font_size)
+
+    resolved_font_color = font_color if font_color else (
+        brand_kit.get("caption_text_color") if brand_kit else None
+    )
+    resolved_font_color = sanitize_color(resolved_font_color, settings.caption_text_color)
+
+    resolved_box_color = box_color if box_color else (
+        brand_kit.get("caption_box_color") if brand_kit else None
+    )
+    resolved_box_color = sanitize_color(resolved_box_color, settings.caption_box_color)
+
+    resolved_box_opacity = box_opacity if box_opacity is not None else (
+        brand_kit.get("caption_box_opacity") if brand_kit else None
+    )
+    resolved_box_opacity = (
+        float(resolved_box_opacity) if resolved_box_opacity is not None else settings.caption_box_opacity
+    )
+    if resolved_box_opacity < 0 or resolved_box_opacity > 1:
+        raise JobError("caption box opacity must be between 0 and 1")
+
+    resolved_highlight = highlight_color if highlight_color else (
+        brand_kit.get("caption_highlight_color") if brand_kit else None
+    )
+    resolved_highlight = sanitize_color(resolved_highlight, settings.caption_highlight_color)
+
+    resolved_padding = padding_px if padding_px is not None else (
+        brand_kit.get("caption_padding_px") if brand_kit else None
+    )
+    resolved_padding = int(resolved_padding or settings.caption_padding_px)
+    if resolved_padding < 0:
+        raise JobError("caption_padding_px must be >= 0")
+
+    resolved_safe_bottom = safe_zone_bottom_px if safe_zone_bottom_px is not None else (
+        brand_kit.get("caption_safe_zone_bottom_px") if brand_kit else None
+    )
+    resolved_safe_top = safe_zone_top_px if safe_zone_top_px is not None else (
+        brand_kit.get("caption_safe_zone_top_px") if brand_kit else None
+    )
+    resolved_safe_bottom = int(resolved_safe_bottom or settings.caption_safe_zone_bottom_px)
+    resolved_safe_top = int(resolved_safe_top or settings.caption_safe_zone_top_px)
+    if resolved_safe_bottom < 0 or resolved_safe_top < 0:
+        raise JobError("caption safe zones must be >= 0")
+
+    resolved_font_name = font_name if font_name else (
+        brand_kit.get("caption_font_name") if brand_kit else None
+    )
+    resolved_font_asset_id = font_asset_id if font_asset_id else (
+        brand_kit.get("caption_font_asset_id") if brand_kit else None
+    )
+    if brand_kit and not resolved_font_name and not resolved_font_asset_id:
+        resolved_font_name = brand_kit.get("font_name")
+        resolved_font_asset_id = brand_kit.get("font_asset_id")
+
+    segments = parse_captions_input(
+        captions_srt,
+        captions_vtt,
+        words_json,
+        resolved_max_chars,
+        resolved_max_lines,
+        resolved_max_words,
+        highlight_mode,
+    )
+    if not segments:
+        raise JobError("No captions to render")
+    if len(segments) > settings.max_caption_segments:
+        raise JobError("Too many caption segments")
+
+    _ensure_temp_dir()
+    input_path, cleanup = _resolve_input_path(asset)
+    output_path = os.path.join(settings.storage_temp_dir, f"{uuid.uuid4().hex}.mp4")
+    font_cleanup = False
+    font_path = None
+    text_paths: list[str] = []
+    logs = ""
+    try:
+        font_path, font_cleanup = resolve_font_path(resolved_font_name, resolved_font_asset_id)
+        x_expr, y_expr = _caption_overlay_xy(
+            resolved_position,
+            resolved_safe_bottom,
+            resolved_safe_top,
+        )
+        line_spacing = settings.caption_line_spacing
+        box_color_value = _apply_opacity(resolved_box_color, resolved_box_opacity)
+        color_value = resolved_highlight if highlight_mode == "word" else resolved_font_color
+
+        filters: list[str] = []
+        for seg in segments:
+            start = float(seg["start"])
+            end = float(seg["end"])
+            if end <= start:
+                continue
+            text = seg.get("text") or ""
+            with tempfile.NamedTemporaryFile(
+                dir=settings.storage_temp_dir, prefix="caption_", suffix=".txt", delete=False
+            ) as handle:
+                handle.write(text.encode("utf-8"))
+                text_paths.append(handle.name)
+
+            drawtext_parts = [
+                f"fontfile={escape_drawtext_value(font_path)}",
+                f"textfile={escape_drawtext_value(text_paths[-1])}",
+                f"fontcolor={color_value}",
+                f"fontsize={resolved_font_size}",
+                f"x={x_expr}",
+                f"y={y_expr}",
+                f"line_spacing={line_spacing}",
+                "box=1",
+                f"boxcolor={box_color_value}",
+                f"boxborderw={resolved_padding}",
+                f"enable='between(t,{start:.3f},{end:.3f})'",
+                "expansion=none",
+            ]
+            filters.append("drawtext=" + ":".join(drawtext_parts))
+
+        if not filters:
+            raise JobError("No caption segments to render")
+
+        filter_chain = ",".join(filters)
+        args = [
+            "-i",
+            input_path,
+            "-vf",
+            filter_chain,
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "23",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "160k",
+            "-movflags",
+            "+faststart",
+            output_path,
+        ]
+        logs = run_ffmpeg(args, timeout=settings.text_timeout_seconds())
+        update_job(job_id, {"progress": 80, "updated_at": utc_now_iso()})
+        _enforce_output_size(output_path)
+        probe = _probe_optional(output_path)
+        if probe and probe.get("duration_sec") and probe["duration_sec"] > settings.max_duration_seconds:
+            raise JobError("Output exceeds max duration")
+        ttl_seconds = settings.asset_ttl_seconds()
+        output_asset = _create_output_asset(
+            output_path,
+            "video/mp4",
+            ".mp4",
+            asset_id,
+            ttl_seconds,
+            probe,
+        )
+        _finish_job(
+            job_id,
+            "success",
+            {
+                "output_asset_ids": [output_asset["asset_id"]],
+                "logs_short": logs,
+                "finished_at": utc_now_iso(),
+            },
+        )
+        _record_job_metrics("captions_burn_in", start_ts, "success", job_id)
+        if cache_key:
+            set_cached_result(
+                cache_key,
+                {
+                    "output_asset_ids": [output_asset["asset_id"]],
+                    "created_at": utc_now_iso(),
+                    "job_type": "captions_burn_in",
+                },
+                settings.asset_ttl_seconds(),
+            )
+        return output_asset
+    except (FfmpegError, JobError, ValueError) as exc:
+        _finish_job(
+            job_id,
+            "error",
+            {"error": str(exc), "logs_short": logs, "finished_at": utc_now_iso()},
+        )
+        _record_job_metrics("captions_burn_in", start_ts, "error", job_id)
+        raise
+    finally:
+        if cleanup and os.path.exists(input_path):
+            os.remove(input_path)
+        if font_cleanup and font_path and os.path.exists(font_path):
+            os.remove(font_path)
+        for path in text_paths:
+            if os.path.exists(path):
+                os.remove(path)
         if os.path.exists(output_path):
             os.remove(output_path)
 
@@ -2187,11 +2731,533 @@ def audio_trim_silence_job(
             os.remove(output_path)
 
 
+def video_replace_audio_job(
+    video_asset_id: str,
+    audio_asset_id: str,
+    audio_bitrate: str | None,
+    cache_key: str | None = None,
+    job_id_override: str | None = None,
+) -> dict[str, Any]:
+    job = get_current_job()
+    job_id = job_id_override if job_id_override is not None else (job.id if job else "")
+    start_ts = job_timer()
+    _log_job_started("video_replace_audio", job_id, video_asset_id)
+    _finish_job(
+        job_id,
+        "running",
+        {"started_at": utc_now_iso(), "progress": 10, "cache_key": cache_key},
+    )
+
+    video_asset = _get_asset_or_error(video_asset_id)
+    audio_asset = _get_asset_or_error(audio_asset_id)
+    _ensure_video_asset(video_asset)
+    _ensure_audio_asset(audio_asset)
+
+    _ensure_temp_dir()
+    video_path, video_cleanup = _resolve_input_path(video_asset)
+    audio_path, audio_cleanup = _resolve_input_path(audio_asset)
+    output_path = os.path.join(settings.storage_temp_dir, f"{uuid.uuid4().hex}.mp4")
+    logs = ""
+    try:
+        video_probe = _probe_optional(video_path)
+        audio_probe = _probe_optional(audio_path)
+        use_shortest = True
+        if video_probe and audio_probe:
+            video_duration = video_probe.get("duration_sec")
+            audio_duration = audio_probe.get("duration_sec")
+            if video_duration and audio_duration:
+                use_shortest = audio_duration >= video_duration
+
+        args = [
+            "-i",
+            video_path,
+            "-i",
+            audio_path,
+            "-map",
+            "0:v:0",
+            "-map",
+            "1:a:0",
+            "-c:v",
+            "copy",
+            "-c:a",
+            "aac",
+        ]
+        if audio_bitrate:
+            args += ["-b:a", str(audio_bitrate)]
+        if use_shortest:
+            args.append("-shortest")
+        args += [
+            "-movflags",
+            "+faststart",
+            output_path,
+        ]
+        logs = run_ffmpeg(args, timeout=settings.ffmpeg_timeout_seconds)
+        update_job(job_id, {"progress": 80, "updated_at": utc_now_iso()})
+        _enforce_output_size(output_path)
+        probe_out = _probe_optional(output_path)
+        if probe_out and probe_out.get("duration_sec") and probe_out["duration_sec"] > settings.max_duration_seconds:
+            raise JobError("Output exceeds max duration")
+        ttl_seconds = settings.asset_ttl_seconds()
+        output_asset = _create_output_asset(
+            output_path,
+            "video/mp4",
+            ".mp4",
+            video_asset_id,
+            ttl_seconds,
+            probe_out,
+        )
+        _finish_job(
+            job_id,
+            "success",
+            {
+                "output_asset_ids": [output_asset["asset_id"]],
+                "logs_short": logs,
+                "finished_at": utc_now_iso(),
+            },
+        )
+        _record_job_metrics("video_replace_audio", start_ts, "success", job_id)
+        if cache_key:
+            set_cached_result(
+                cache_key,
+                {
+                    "output_asset_ids": [output_asset["asset_id"]],
+                    "created_at": utc_now_iso(),
+                    "job_type": "video_replace_audio",
+                },
+                settings.asset_ttl_seconds(),
+            )
+        return output_asset
+    except (FfmpegError, JobError, ValueError) as exc:
+        _finish_job(
+            job_id,
+            "error",
+            {"error": str(exc), "logs_short": logs, "finished_at": utc_now_iso()},
+        )
+        _record_job_metrics("video_replace_audio", start_ts, "error", job_id)
+        raise
+    finally:
+        if video_cleanup and os.path.exists(video_path):
+            os.remove(video_path)
+        if audio_cleanup and os.path.exists(audio_path):
+            os.remove(audio_path)
+        if os.path.exists(output_path):
+            os.remove(output_path)
+
+
+def video_analyze_job(
+    asset_id: str,
+    rubric_name: str | None,
+    target_preset: str | None,
+    captions_srt: str | None,
+    captions_vtt: str | None,
+    words_json: list[dict[str, Any]] | None,
+    brand_kit_id: str | None,
+    position: str | None,
+    font_size: int | None,
+    padding_px: int | None,
+    max_chars: int | None,
+    max_lines: int | None,
+    max_words: int | None,
+    safe_zone_bottom_px: int | None,
+    safe_zone_top_px: int | None,
+    cache_key: str | None = None,
+    job_id_override: str | None = None,
+) -> dict[str, Any]:
+    job = get_current_job()
+    job_id = job_id_override if job_id_override is not None else (job.id if job else "")
+    start_ts = job_timer()
+    _log_job_started("video_analyze", job_id, asset_id)
+    _finish_job(
+        job_id,
+        "running",
+        {"started_at": utc_now_iso(), "progress": 5, "cache_key": cache_key},
+    )
+
+    asset = _get_asset_or_error(asset_id)
+    _ensure_video_asset(asset)
+
+    rubric = get_rubric(rubric_name) if rubric_name else None
+    targets = rubric.get("targets", {}) if rubric else {}
+
+    brand_kit = get_brand_kit(brand_kit_id) if brand_kit_id else None
+    if brand_kit_id and not brand_kit:
+        raise JobError("brand_kit_id not found")
+
+    _ensure_temp_dir()
+    input_path, cleanup = _resolve_input_path(asset)
+    try:
+        probe = _probe_or_error(input_path)
+        duration = probe.get("duration_sec")
+        width = probe.get("width")
+        height = probe.get("height")
+        size_bytes = asset.get("size_bytes")
+        bitrate_kbps = None
+        if duration and size_bytes:
+            bitrate_kbps = round((float(size_bytes) * 8.0) / float(duration) / 1000.0, 2)
+
+        expected_w, expected_h = _expected_dims_from_preset(target_preset)
+        resolution_ok = None
+        if width and height:
+            if expected_w and expected_h:
+                resolution_ok = int(width) == expected_w and int(height) == expected_h
+            elif targets.get("min_width") and targets.get("min_height"):
+                resolution_ok = int(width) >= int(targets["min_width"]) and int(height) >= int(
+                    targets["min_height"]
+                )
+
+        file_size_ok = None
+        if size_bytes:
+            file_size_ok = int(size_bytes) <= settings.max_output_bytes
+
+        bitrate_ok = None
+        if bitrate_kbps is not None and targets.get("bitrate_kbps_max") is not None:
+            bitrate_ok = float(bitrate_kbps) <= float(targets["bitrate_kbps_max"])
+
+        loudness_lufs = None
+        true_peak_db = None
+        lra = None
+        silence_pct = None
+        clipping_pct = None
+
+        if _has_audio_stream(probe):
+            try:
+                loudnorm_logs = run_ffmpeg(
+                    [
+                        "-i",
+                        input_path,
+                        "-vn",
+                        "-af",
+                        f"loudnorm=I={settings.audio_norm_i}:TP={settings.audio_norm_tp}:"
+                        f"LRA={settings.audio_norm_lra}:print_format=json",
+                        "-f",
+                        "null",
+                        "-",
+                    ],
+                    timeout=settings.audio_timeout_seconds(),
+                )
+                payload = _parse_loudnorm_json(loudnorm_logs) or {}
+                for key, fallback in [
+                    ("input_i", "measured_I"),
+                    ("input_tp", "measured_TP"),
+                    ("input_lra", "measured_LRA"),
+                ]:
+                    if key in payload:
+                        value = payload.get(key)
+                    else:
+                        value = payload.get(fallback)
+                    try:
+                        value = float(value)
+                    except (TypeError, ValueError):
+                        value = None
+                    if key == "input_i":
+                        loudness_lufs = value
+                    elif key == "input_tp":
+                        true_peak_db = value
+                    elif key == "input_lra":
+                        lra = value
+            except FfmpegError:
+                pass
+
+            try:
+                silence_logs = run_ffmpeg(
+                    [
+                        "-i",
+                        input_path,
+                        "-vn",
+                        "-af",
+                        f"silencedetect=noise={settings.audio_silence_db}dB:"
+                        f"d={settings.audio_min_silence_sec}",
+                        "-f",
+                        "null",
+                        "-",
+                    ],
+                    timeout=settings.audio_timeout_seconds(),
+                )
+                silence_pct = _parse_silencedetect(silence_logs, duration)
+            except FfmpegError:
+                pass
+
+            if rubric and rubric.get("weights", {}).get("audio.clipping_pct", 0) > 0:
+                try:
+                    clipping_logs = run_ffmpeg(
+                        [
+                            "-i",
+                            input_path,
+                            "-vn",
+                            "-af",
+                            "astats=metadata=1:reset=1",
+                            "-f",
+                            "null",
+                            "-",
+                        ],
+                        timeout=settings.audio_timeout_seconds(),
+                    )
+                    clipping_pct = _parse_astats_clipping(clipping_logs)
+                except FfmpegError:
+                    pass
+
+        black_frames_pct = None
+        if _has_video_stream(probe):
+            try:
+                black_logs = run_ffmpeg(
+                    [
+                        "-i",
+                        input_path,
+                        "-an",
+                        "-vf",
+                        "blackdetect=d=0.1:pic_th=0.98",
+                        "-f",
+                        "null",
+                        "-",
+                    ],
+                    timeout=settings.ffmpeg_timeout_seconds,
+                )
+                black_frames_pct = _parse_blackdetect(black_logs, duration)
+            except FfmpegError:
+                pass
+
+        captions_metrics = {
+            "caption_readability_score": None,
+            "caption_speed_score": None,
+            "caption_speed_wpm": None,
+            "safe_zone_violations": None,
+        }
+        if captions_srt or captions_vtt or words_json:
+            resolved_max_chars = max_chars if max_chars is not None else (
+                brand_kit.get("caption_max_chars") if brand_kit else None
+            )
+            resolved_max_lines = max_lines if max_lines is not None else (
+                brand_kit.get("caption_max_lines") if brand_kit else None
+            )
+            resolved_max_words = max_words if max_words is not None else (
+                brand_kit.get("caption_max_words") if brand_kit else None
+            )
+            resolved_max_chars = int(resolved_max_chars or settings.caption_max_chars)
+            resolved_max_lines = int(resolved_max_lines or settings.caption_max_lines)
+            resolved_max_words = int(resolved_max_words or settings.caption_max_words)
+
+            resolved_position = position if position else (
+                brand_kit.get("caption_position") if brand_kit else None
+            )
+            if not resolved_position:
+                resolved_position = settings.caption_position
+            resolved_position = sanitize_position(resolved_position, CAPTION_POSITIONS)
+
+            resolved_padding = padding_px if padding_px is not None else (
+                brand_kit.get("caption_padding_px") if brand_kit else None
+            )
+            resolved_padding = int(resolved_padding or settings.caption_padding_px)
+
+            resolved_safe_bottom = safe_zone_bottom_px if safe_zone_bottom_px is not None else (
+                brand_kit.get("caption_safe_zone_bottom_px") if brand_kit else None
+            )
+            resolved_safe_top = safe_zone_top_px if safe_zone_top_px is not None else (
+                brand_kit.get("caption_safe_zone_top_px") if brand_kit else None
+            )
+            resolved_safe_bottom = int(resolved_safe_bottom or settings.caption_safe_zone_bottom_px)
+            resolved_safe_top = int(resolved_safe_top or settings.caption_safe_zone_top_px)
+
+            resolved_font_size = font_size if font_size is not None else (
+                brand_kit.get("caption_font_size") if brand_kit else None
+            )
+            resolved_font_size = sanitize_font_size(resolved_font_size, settings.caption_font_size)
+
+            segments = parse_captions_input(
+                captions_srt,
+                captions_vtt,
+                words_json,
+                resolved_max_chars,
+                resolved_max_lines,
+                resolved_max_words,
+                None,
+            )
+            speed_target = float(targets.get("caption_speed_wpm_max", 180.0))
+            captions_metrics = _caption_metrics(
+                segments,
+                resolved_max_chars,
+                resolved_max_lines,
+                resolved_max_words,
+                resolved_position,
+                resolved_safe_bottom,
+                resolved_safe_top,
+                resolved_padding,
+                resolved_font_size,
+                speed_target,
+            )
+
+        report = {
+            "asset_id": asset_id,
+            "duration_sec": duration,
+            "video": {
+                "width": width,
+                "height": height,
+                "bitrate_kbps": bitrate_kbps,
+                "file_size_bytes": size_bytes,
+                "resolution_ok": resolution_ok,
+                "bitrate_ok": bitrate_ok,
+                "file_size_ok": file_size_ok,
+                "black_frames_pct": black_frames_pct,
+            },
+            "audio": {
+                "loudness_lufs": loudness_lufs,
+                "true_peak_db": true_peak_db,
+                "lra": lra,
+                "silence_pct": silence_pct,
+                "clipping_pct": clipping_pct,
+            },
+            "captions": captions_metrics,
+        }
+
+        if rubric:
+            report["rubric"] = {"name": rubric_name, **score_report(report, rubric)}
+        if target_preset:
+            report["target_preset"] = target_preset
+
+        _finish_job(
+            job_id,
+            "success",
+            {
+                "output_asset_ids": [asset_id],
+                "report": report,
+                "logs_short": "analysis complete",
+                "finished_at": utc_now_iso(),
+            },
+        )
+        _record_job_metrics("video_analyze", start_ts, "success", job_id)
+        if cache_key:
+            set_cached_result(
+                cache_key,
+                {
+                    "output_asset_ids": [asset_id],
+                    "created_at": utc_now_iso(),
+                    "job_type": "video_analyze",
+                    "report": report,
+                },
+                settings.asset_ttl_seconds(),
+            )
+        return report
+    except (FfmpegError, JobError, ValueError) as exc:
+        _finish_job(
+            job_id,
+            "error",
+            {"error": str(exc), "logs_short": None, "finished_at": utc_now_iso()},
+        )
+        _record_job_metrics("video_analyze", start_ts, "error", job_id)
+        raise
+    finally:
+        if cleanup and os.path.exists(input_path):
+            os.remove(input_path)
+
+
+def asset_compare_job(
+    asset_ids: list[str],
+    rubric_name: str,
+    target_preset: str | None,
+    cache_key: str | None = None,
+    job_id_override: str | None = None,
+) -> dict[str, Any]:
+    job = get_current_job()
+    job_id = job_id_override if job_id_override is not None else (job.id if job else "")
+    start_ts = job_timer()
+    _log_job_started("asset_compare", job_id, asset_ids[0] if asset_ids else None)
+    _finish_job(
+        job_id,
+        "running",
+        {"started_at": utc_now_iso(), "progress": 5, "cache_key": cache_key},
+    )
+
+    if not asset_ids:
+        raise JobError("asset_ids is required")
+    if len(asset_ids) > settings.max_batch_assets:
+        raise JobError("Too many assets to compare")
+
+    results: list[dict[str, Any]] = []
+    try:
+        for idx, asset_id in enumerate(asset_ids):
+            _get_asset_or_error(asset_id)
+            report = video_analyze_job(
+                asset_id,
+                rubric_name,
+                target_preset,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                cache_key=None,
+                job_id_override="",
+            )
+            score = None
+            rubric_report = report.get("rubric") if isinstance(report, dict) else None
+            if rubric_report:
+                score = rubric_report.get("score")
+            results.append(
+                {
+                    "asset_id": asset_id,
+                    "score": score,
+                    "passed": rubric_report.get("passed") if rubric_report else None,
+                    "report": report,
+                }
+            )
+            update_job(
+                job_id,
+                {
+                    "progress": 5 + int(90 * ((idx + 1) / len(asset_ids))),
+                    "updated_at": utc_now_iso(),
+                },
+            )
+
+        ranked = sorted(
+            results,
+            key=lambda item: (item.get("score") is not None, item.get("score", 0)),
+            reverse=True,
+        )
+        _finish_job(
+            job_id,
+            "success",
+            {
+                "output_asset_ids": [item["asset_id"] for item in ranked],
+                "ranking": ranked,
+                "logs_short": "compare complete",
+                "finished_at": utc_now_iso(),
+            },
+        )
+        _record_job_metrics("asset_compare", start_ts, "success", job_id)
+        if cache_key:
+            set_cached_result(
+                cache_key,
+                {
+                    "output_asset_ids": [item["asset_id"] for item in ranked],
+                    "created_at": utc_now_iso(),
+                    "job_type": "asset_compare",
+                    "ranking": ranked,
+                },
+                settings.asset_ttl_seconds(),
+            )
+        return {"ranking": ranked}
+    except (FfmpegError, JobError, ValueError) as exc:
+        _finish_job(
+            job_id,
+            "error",
+            {"error": str(exc), "logs_short": None, "finished_at": utc_now_iso()},
+        )
+        _record_job_metrics("asset_compare", start_ts, "error", job_id)
+        raise
+
+
 def template_apply_job(
     asset_id: str,
     template_name: str,
     variables: dict[str, Any] | None,
     brand_kit_id: str | None,
+    quality: str | None,
     cache_key: str | None = None,
     job_id_override: str | None = None,
 ) -> dict[str, Any]:
@@ -2205,17 +3271,22 @@ def template_apply_job(
         {"started_at": utc_now_iso(), "progress": 5, "cache_key": cache_key},
     )
 
+    quality_value = None
+    if quality:
+        quality_value = quality.strip().lower()
+        if quality_value not in {"final", "draft"}:
+            raise JobError("quality must be 'final' or 'draft'")
+
     asset = _get_asset_or_error(asset_id)
     template = get_template(template_name)
     layers = list(template.get("layers", []))
     if len(layers) > settings.max_template_layers:
         raise JobError("Template exceeds max layers")
 
-    vars_in = variables or {}
-    if not isinstance(vars_in, dict):
-        raise JobError("variables must be an object")
-    merged_vars = dict(template.get("defaults", {}))
-    merged_vars.update(vars_in)
+    try:
+        merged_vars = validate_template_variables(template, variables)
+    except ValueError as exc:
+        raise JobError(str(exc)) from None
 
     brand_kit = None
     if brand_kit_id:
@@ -2317,6 +3388,8 @@ def template_apply_job(
                 preset = params.get("preset")
                 if not preset:
                     raise JobError("transcode layer requires preset")
+                if quality_value == "draft":
+                    preset = draft_preset_for(str(preset))
                 output_asset = transcode_job(
                     current_asset_id, preset, cache_key=layer_cache_key, job_id_override=""
                 )
@@ -2613,6 +3686,7 @@ def campaign_process_job(
     template_name: str | None,
     variables: dict[str, Any] | None,
     brand_kit_id: str | None,
+    quality: str | None,
     cache_key: str | None = None,
     job_id_override: str | None = None,
 ) -> dict[str, Any]:
@@ -2625,6 +3699,12 @@ def campaign_process_job(
         "running",
         {"started_at": utc_now_iso(), "progress": 5, "cache_key": cache_key},
     )
+
+    quality_value = None
+    if quality:
+        quality_value = quality.strip().lower()
+        if quality_value not in {"final", "draft"}:
+            raise JobError("quality must be 'final' or 'draft'")
 
     if not asset_ids:
         raise JobError("asset_ids is required")
@@ -2645,6 +3725,7 @@ def campaign_process_job(
                         "template_name": template_name,
                         "variables": variables or {},
                         "brand_kit_id": brand_kit_id,
+                        "quality": quality_value,
                     },
                 )
                 cached_output = _resolve_cached_output(template_cache_key)
@@ -2656,22 +3737,27 @@ def campaign_process_job(
                         template_name,
                         variables or {},
                         brand_kit_id,
+                        quality_value,
                         cache_key=template_cache_key,
                         job_id_override="",
                     )
                     base_asset_id = output_asset["asset_id"]
 
             if presets:
+                resolved_presets = map_presets_for_quality(presets, quality_value)
                 batch_cache_key = build_cache_key(
                     "ffmpeg:batch_export",
-                    {"asset_id": base_asset_id, "presets": presets},
+                    {"asset_id": base_asset_id, "presets": resolved_presets},
                 )
                 cached_ids = _resolve_cached_outputs_list(batch_cache_key)
                 if cached_ids:
                     outputs[asset_id] = list(cached_ids)
                 else:
                     batch_result = batch_export_job(
-                        base_asset_id, presets, cache_key=batch_cache_key, job_id_override=""
+                        base_asset_id,
+                        resolved_presets,
+                        cache_key=batch_cache_key,
+                        job_id_override="",
                     )
                     outputs[asset_id] = list(batch_result.get("output_asset_ids") or [])
             else:
@@ -2985,6 +4071,7 @@ def workflow_job(
                             params.get("template_name"),
                             params.get("variables") or {},
                             params.get("brand_kit_id"),
+                            params.get("quality"),
                             cache_key=node_cache_key,
                             job_id_override="",
                         )
@@ -3052,4 +4139,1114 @@ def workflow_job(
             {"error": str(exc), "logs_short": None, "finished_at": utc_now_iso()},
         )
         _record_job_metrics("workflow_run", start_ts, "error", job_id)
+        raise
+
+
+def _render_marketing_job(
+    job_type: str,
+    template_name: str,
+    primary_asset_id: str,
+    variables: dict[str, Any],
+    brand_kit_id: str | None,
+    broll_asset_ids: list[str] | None,
+    voice_asset_id: str | None,
+    music_asset_id: str | None,
+    captions_srt: str | None,
+    captions_vtt: str | None,
+    words_json: list[dict[str, Any]] | None,
+    highlight_mode: str | None,
+    include_16_9: bool | None,
+    quality: str | None,
+    framing_mode: str | None,
+    caption_position: str | None,
+    caption_font_size: int | None,
+    caption_font_color: str | None,
+    caption_box_color: str | None,
+    caption_box_opacity: float | None,
+    caption_highlight_color: str | None,
+    caption_padding_px: int | None,
+    caption_max_chars: int | None,
+    caption_max_lines: int | None,
+    caption_max_words: int | None,
+    caption_safe_zone_bottom_px: int | None,
+    caption_safe_zone_top_px: int | None,
+    caption_font_name: str | None,
+    caption_font_asset_id: str | None,
+    audio_target_lufs: float | None,
+    audio_lra: float | None,
+    audio_true_peak: float | None,
+    ducking_ratio: float | None,
+    ducking_threshold: float | None,
+    ducking_attack_ms: int | None,
+    ducking_release_ms: int | None,
+    music_gain: float | None,
+    voice_gain: float | None,
+    trim_silence: bool | None,
+    trim_silence_min_sec: float | None,
+    trim_silence_threshold_db: float | None,
+    cache_key: str | None = None,
+    job_id_override: str | None = None,
+) -> dict[str, Any]:
+    job = get_current_job()
+    job_id = job_id_override if job_id_override is not None else (job.id if job else "")
+    start_ts = job_timer()
+    _log_job_started(job_type, job_id, primary_asset_id)
+    _finish_job(
+        job_id,
+        "running",
+        {"started_at": utc_now_iso(), "progress": 5, "cache_key": cache_key},
+    )
+
+    try:
+        if not primary_asset_id:
+            raise JobError("primary_asset_id is required")
+        if broll_asset_ids is not None and not isinstance(broll_asset_ids, list):
+            raise JobError("broll_asset_ids must be a list")
+
+        template = get_template(template_name)
+        try:
+            template_vars = validate_template_variables(template, variables)
+        except ValueError as exc:
+            raise JobError(str(exc)) from None
+
+        include_16_9 = bool(include_16_9) if include_16_9 is not None else False
+        quality = (quality or "final").strip().lower()
+        if quality not in {"final", "draft"}:
+            raise JobError("quality must be 'final' or 'draft'")
+
+        framing_mode = (framing_mode or "safe_pad").strip().lower()
+        if framing_mode not in {"safe_pad", "crop"}:
+            raise JobError("framing_mode must be 'safe_pad' or 'crop'")
+
+        base_asset_id = _coerce_video_asset_id(primary_asset_id)
+        if broll_asset_ids:
+            video_ids = [base_asset_id]
+            for asset_id in broll_asset_ids:
+                if not asset_id:
+                    continue
+                video_ids.append(_coerce_video_asset_id(asset_id))
+            if len(video_ids) > 1:
+                concat_cache_key = build_cache_key(
+                    "ffmpeg:video_concat",
+                    {
+                        "asset_ids": video_ids,
+                        "transition": None,
+                        "transition_duration": None,
+                        "target_width": None,
+                        "target_height": None,
+                        "include_audio": True,
+                    },
+                )
+                cached_concat = _resolve_cached_output(concat_cache_key)
+                if cached_concat:
+                    base_asset_id = cached_concat
+                else:
+                    concat_asset = video_concat_job(
+                        video_ids,
+                        None,
+                        None,
+                        None,
+                        None,
+                        True,
+                        cache_key=concat_cache_key,
+                        job_id_override="",
+                    )
+                    base_asset_id = concat_asset["asset_id"]
+
+        mixed_audio_id = None
+        voice_audio_id = _coerce_audio_asset_id(voice_asset_id) if voice_asset_id else None
+        music_audio_id = _coerce_audio_asset_id(music_asset_id) if music_asset_id else None
+        if voice_audio_id and trim_silence:
+            trim_cache_key = build_cache_key(
+                "ffmpeg:audio_trim_silence",
+                {
+                    "asset_id": voice_audio_id,
+                    "output_format": "m4a",
+                    "min_silence_sec": trim_silence_min_sec,
+                    "threshold_db": trim_silence_threshold_db,
+                    "trim_leading": True,
+                    "trim_trailing": True,
+                    "bitrate": None,
+                },
+            )
+            cached_trim = _resolve_cached_output(trim_cache_key)
+            if cached_trim:
+                voice_audio_id = cached_trim
+            else:
+                trimmed = audio_trim_silence_job(
+                    voice_audio_id,
+                    "m4a",
+                    trim_silence_min_sec,
+                    trim_silence_threshold_db,
+                    True,
+                    True,
+                    None,
+                    cache_key=trim_cache_key,
+                    job_id_override="",
+                )
+                voice_audio_id = trimmed["asset_id"]
+
+        if voice_audio_id or music_audio_id:
+            if voice_audio_id and music_audio_id:
+                mix_cache_key = build_cache_key(
+                    "ffmpeg:audio_mix_with_background",
+                    {
+                        "voice_asset_id": voice_audio_id,
+                        "music_asset_id": music_audio_id,
+                        "output_format": "m4a",
+                        "ducking": None,
+                        "ratio": ducking_ratio,
+                        "threshold": ducking_threshold,
+                        "attack_ms": ducking_attack_ms,
+                        "release_ms": ducking_release_ms,
+                        "music_gain": music_gain,
+                        "voice_gain": voice_gain,
+                        "bitrate": None,
+                    },
+                )
+                cached_mix = _resolve_cached_output(mix_cache_key)
+                if cached_mix:
+                    mixed_audio_id = cached_mix
+                else:
+                    mix_asset = audio_mix_with_background_job(
+                        voice_audio_id,
+                        music_audio_id,
+                        "m4a",
+                        None,
+                        ducking_ratio,
+                        ducking_threshold,
+                        ducking_attack_ms,
+                        ducking_release_ms,
+                        music_gain,
+                        voice_gain,
+                        None,
+                        cache_key=mix_cache_key,
+                        job_id_override="",
+                    )
+                    mixed_audio_id = mix_asset["asset_id"]
+            elif voice_audio_id:
+                norm_cache_key = build_cache_key(
+                    "ffmpeg:audio_normalize",
+                    {
+                        "asset_id": voice_audio_id,
+                        "output_format": "m4a",
+                        "target_lufs": audio_target_lufs,
+                        "lra": audio_lra,
+                        "true_peak": audio_true_peak,
+                        "bitrate": None,
+                    },
+                )
+                cached_norm = _resolve_cached_output(norm_cache_key)
+                if cached_norm:
+                    mixed_audio_id = cached_norm
+                else:
+                    norm_asset = audio_normalize_job(
+                        voice_audio_id,
+                        "m4a",
+                        audio_target_lufs,
+                        audio_lra,
+                        audio_true_peak,
+                        None,
+                        cache_key=norm_cache_key,
+                        job_id_override="",
+                    )
+                    mixed_audio_id = norm_asset["asset_id"]
+            elif music_audio_id:
+                norm_cache_key = build_cache_key(
+                    "ffmpeg:audio_normalize",
+                    {
+                        "asset_id": music_audio_id,
+                        "output_format": "m4a",
+                        "target_lufs": audio_target_lufs,
+                        "lra": audio_lra,
+                        "true_peak": audio_true_peak,
+                        "bitrate": None,
+                    },
+                )
+                cached_norm = _resolve_cached_output(norm_cache_key)
+                if cached_norm:
+                    mixed_audio_id = cached_norm
+                else:
+                    norm_asset = audio_normalize_job(
+                        music_audio_id,
+                        "m4a",
+                        audio_target_lufs,
+                        audio_lra,
+                        audio_true_peak,
+                        None,
+                        cache_key=norm_cache_key,
+                        job_id_override="",
+                    )
+                    mixed_audio_id = norm_asset["asset_id"]
+
+        preset_maps = {
+            "safe_pad": {
+                "final": {
+                    "9x16": "mp4_social_vertical_1080x1920_safe_pad",
+                    "1x1": "mp4_social_square_1080x1080_safe_pad",
+                    "4x5": "mp4_social_portrait_1080x1350_safe_pad",
+                    "16x9": "mp4_youtube_1920x1080",
+                },
+                "draft": {
+                    "9x16": "mp4_social_vertical_720x1280_safe_pad",
+                    "1x1": "mp4_social_square_720x720_safe_pad",
+                    "4x5": "mp4_social_portrait_720x900_safe_pad",
+                    "16x9": "mp4_youtube_1280x720",
+                },
+            },
+            "crop": {
+                "final": {
+                    "9x16": "mp4_social_vertical_1080x1920",
+                    "1x1": "mp4_social_square_1080x1080",
+                    "4x5": "mp4_social_portrait_1080x1350",
+                    "16x9": "mp4_youtube_1920x1080",
+                },
+                "draft": {
+                    "9x16": "mp4_social_vertical_720x1280",
+                    "1x1": "mp4_social_square_720x720",
+                    "4x5": "mp4_social_portrait_720x900",
+                    "16x9": "mp4_youtube_1280x720",
+                },
+            },
+        }
+        variants = ["9x16", "1x1", "4x5"]
+        if include_16_9:
+            variants.append("16x9")
+        preset_map = preset_maps[framing_mode]["draft" if quality == "draft" else "final"]
+
+        outputs: dict[str, dict[str, str | None]] = {}
+        output_ids: list[str] = []
+        total_variants = max(len(variants), 1)
+        for idx, variant in enumerate(variants):
+            preset_name = preset_map[variant]
+            layer_vars = dict(template_vars)
+            layer_vars["preset"] = preset_name
+
+            template_cache_key = build_cache_key(
+                "ffmpeg:template_apply",
+                {
+                    "asset_id": base_asset_id,
+                    "template_name": template_name,
+                    "variables": layer_vars,
+                    "brand_kit_id": brand_kit_id,
+                    "quality": quality,
+                },
+            )
+            cached_output = _resolve_cached_output(template_cache_key)
+            if cached_output:
+                current_asset_id = cached_output
+            else:
+                output_asset = template_apply_job(
+                    base_asset_id,
+                    template_name,
+                    layer_vars,
+                    brand_kit_id,
+                    quality,
+                    cache_key=template_cache_key,
+                    job_id_override="",
+                )
+                current_asset_id = output_asset["asset_id"]
+
+            if mixed_audio_id:
+                audio_bitrate = settings.draft_audio_bitrate if quality == "draft" else "160k"
+                replace_cache_key = build_cache_key(
+                    "ffmpeg:video_replace_audio",
+                    {
+                        "video_asset_id": current_asset_id,
+                        "audio_asset_id": mixed_audio_id,
+                        "audio_bitrate": audio_bitrate,
+                    },
+                )
+                cached_replace = _resolve_cached_output(replace_cache_key)
+                if cached_replace:
+                    current_asset_id = cached_replace
+                else:
+                    replaced = video_replace_audio_job(
+                        current_asset_id,
+                        mixed_audio_id,
+                        audio_bitrate,
+                        cache_key=replace_cache_key,
+                        job_id_override="",
+                    )
+                    current_asset_id = replaced["asset_id"]
+
+            if quality == "draft" and settings.draft_watermark_enabled:
+                opacity_str = f"{settings.draft_watermark_opacity:.3f}".rstrip("0").rstrip(".")
+                watermark_color = f"white@{opacity_str}"
+                watermark_cache_key = build_cache_key(
+                    "ffmpeg:video_add_text",
+                    {
+                        "asset_id": current_asset_id,
+                        "text": settings.draft_watermark_text,
+                        "position": "top",
+                        "font_size": settings.draft_watermark_font_size,
+                        "font_color": watermark_color,
+                        "background_box": False,
+                        "box_color": None,
+                        "box_border_width": None,
+                        "font_name": None,
+                        "font_asset_id": None,
+                    },
+                )
+                cached_watermark = _resolve_cached_output(watermark_cache_key)
+                if cached_watermark:
+                    current_asset_id = cached_watermark
+                else:
+                    watermarked = video_add_text_job(
+                        current_asset_id,
+                        settings.draft_watermark_text,
+                        "top",
+                        settings.draft_watermark_font_size,
+                        watermark_color,
+                        False,
+                        None,
+                        None,
+                        None,
+                        None,
+                        cache_key=watermark_cache_key,
+                        job_id_override="",
+                    )
+                    current_asset_id = watermarked["asset_id"]
+
+            non_captioned_id = current_asset_id
+            captioned_id = None
+            if captions_srt or captions_vtt or words_json:
+                captions_cache_key = build_cache_key(
+                    "ffmpeg:captions_burn_in",
+                    {
+                        "asset_id": current_asset_id,
+                        "captions_srt": captions_srt,
+                        "captions_vtt": captions_vtt,
+                        "words_json": words_json,
+                        "brand_kit_id": brand_kit_id,
+                        "highlight_mode": highlight_mode,
+                        "position": caption_position,
+                        "font_size": caption_font_size,
+                        "font_color": caption_font_color,
+                        "box_color": caption_box_color,
+                        "box_opacity": caption_box_opacity,
+                        "highlight_color": caption_highlight_color,
+                        "padding_px": caption_padding_px,
+                        "max_chars": caption_max_chars,
+                        "max_lines": caption_max_lines,
+                        "max_words": caption_max_words,
+                        "safe_zone_bottom_px": caption_safe_zone_bottom_px,
+                        "safe_zone_top_px": caption_safe_zone_top_px,
+                        "font_name": caption_font_name,
+                        "font_asset_id": caption_font_asset_id,
+                    },
+                )
+                cached_captioned = _resolve_cached_output(captions_cache_key)
+                if cached_captioned:
+                    captioned_id = cached_captioned
+                else:
+                    captioned = captions_burn_in_job(
+                        current_asset_id,
+                        captions_srt,
+                        captions_vtt,
+                        words_json,
+                        brand_kit_id,
+                        highlight_mode,
+                        caption_position,
+                        caption_font_size,
+                        caption_font_color,
+                        caption_box_color,
+                        caption_box_opacity,
+                        caption_highlight_color,
+                        caption_padding_px,
+                        caption_max_chars,
+                        caption_max_lines,
+                        caption_max_words,
+                        caption_safe_zone_bottom_px,
+                        caption_safe_zone_top_px,
+                        caption_font_name,
+                        caption_font_asset_id,
+                        cache_key=captions_cache_key,
+                        job_id_override="",
+                    )
+                    captioned_id = captioned["asset_id"]
+
+            outputs[variant] = {"non_captioned": non_captioned_id, "captioned": captioned_id}
+            output_ids.append(non_captioned_id)
+            if captioned_id:
+                output_ids.append(captioned_id)
+
+            update_job(
+                job_id,
+                {
+                    "progress": 10 + int(85 * ((idx + 1) / total_variants)),
+                    "updated_at": utc_now_iso(),
+                },
+            )
+
+        _finish_job(
+            job_id,
+            "success",
+            {
+                "output_asset_ids": output_ids,
+                "outputs": outputs,
+                "logs_short": "render complete",
+                "finished_at": utc_now_iso(),
+            },
+        )
+        _record_job_metrics(job_type, start_ts, "success", job_id)
+        if cache_key:
+            set_cached_result(
+                cache_key,
+                {
+                    "output_asset_ids": output_ids,
+                    "created_at": utc_now_iso(),
+                    "job_type": job_type,
+                    "outputs": outputs,
+                },
+                settings.asset_ttl_seconds(),
+            )
+        return {"output_asset_ids": output_ids, "outputs": outputs}
+    except (FfmpegError, JobError, ValueError) as exc:
+        _finish_job(
+            job_id,
+            "error",
+            {"error": str(exc), "logs_short": None, "finished_at": utc_now_iso()},
+        )
+        _record_job_metrics(job_type, start_ts, "error", job_id)
+        raise
+
+
+def render_social_ad_job(
+    primary_asset_id: str,
+    hook: str | None,
+    headline: str | None,
+    cta: str | None,
+    price: str | None,
+    brand_kit_id: str | None,
+    broll_asset_ids: list[str] | None,
+    voice_asset_id: str | None,
+    music_asset_id: str | None,
+    captions_srt: str | None,
+    captions_vtt: str | None,
+    words_json: list[dict[str, Any]] | None,
+    highlight_mode: str | None,
+    include_16_9: bool | None,
+    quality: str | None,
+    framing_mode: str | None,
+    caption_position: str | None,
+    caption_font_size: int | None,
+    caption_font_color: str | None,
+    caption_box_color: str | None,
+    caption_box_opacity: float | None,
+    caption_highlight_color: str | None,
+    caption_padding_px: int | None,
+    caption_max_chars: int | None,
+    caption_max_lines: int | None,
+    caption_max_words: int | None,
+    caption_safe_zone_bottom_px: int | None,
+    caption_safe_zone_top_px: int | None,
+    caption_font_name: str | None,
+    caption_font_asset_id: str | None,
+    audio_target_lufs: float | None,
+    audio_lra: float | None,
+    audio_true_peak: float | None,
+    ducking_ratio: float | None,
+    ducking_threshold: float | None,
+    ducking_attack_ms: int | None,
+    ducking_release_ms: int | None,
+    music_gain: float | None,
+    voice_gain: float | None,
+    trim_silence: bool | None,
+    trim_silence_min_sec: float | None,
+    trim_silence_threshold_db: float | None,
+    cache_key: str | None = None,
+    job_id_override: str | None = None,
+) -> dict[str, Any]:
+    variables = {
+        "hook": hook,
+        "headline": headline,
+        "cta": cta,
+        "price": price,
+    }
+    return _render_marketing_job(
+        job_type="render_social_ad",
+        template_name="social_ad_basic",
+        primary_asset_id=primary_asset_id,
+        variables=variables,
+        brand_kit_id=brand_kit_id,
+        broll_asset_ids=broll_asset_ids,
+        voice_asset_id=voice_asset_id,
+        music_asset_id=music_asset_id,
+        captions_srt=captions_srt,
+        captions_vtt=captions_vtt,
+        words_json=words_json,
+        highlight_mode=highlight_mode,
+        include_16_9=include_16_9,
+        quality=quality,
+        framing_mode=framing_mode,
+        caption_position=caption_position,
+        caption_font_size=caption_font_size,
+        caption_font_color=caption_font_color,
+        caption_box_color=caption_box_color,
+        caption_box_opacity=caption_box_opacity,
+        caption_highlight_color=caption_highlight_color,
+        caption_padding_px=caption_padding_px,
+        caption_max_chars=caption_max_chars,
+        caption_max_lines=caption_max_lines,
+        caption_max_words=caption_max_words,
+        caption_safe_zone_bottom_px=caption_safe_zone_bottom_px,
+        caption_safe_zone_top_px=caption_safe_zone_top_px,
+        caption_font_name=caption_font_name,
+        caption_font_asset_id=caption_font_asset_id,
+        audio_target_lufs=audio_target_lufs,
+        audio_lra=audio_lra,
+        audio_true_peak=audio_true_peak,
+        ducking_ratio=ducking_ratio,
+        ducking_threshold=ducking_threshold,
+        ducking_attack_ms=ducking_attack_ms,
+        ducking_release_ms=ducking_release_ms,
+        music_gain=music_gain,
+        voice_gain=voice_gain,
+        trim_silence=trim_silence,
+        trim_silence_min_sec=trim_silence_min_sec,
+        trim_silence_threshold_db=trim_silence_threshold_db,
+        cache_key=cache_key,
+        job_id_override=job_id_override,
+    )
+
+
+def render_testimonial_clip_job(
+    primary_asset_id: str,
+    quote: str | None,
+    author: str | None,
+    brand_kit_id: str | None,
+    broll_asset_ids: list[str] | None,
+    voice_asset_id: str | None,
+    music_asset_id: str | None,
+    captions_srt: str | None,
+    captions_vtt: str | None,
+    words_json: list[dict[str, Any]] | None,
+    highlight_mode: str | None,
+    include_16_9: bool | None,
+    quality: str | None,
+    framing_mode: str | None,
+    caption_position: str | None,
+    caption_font_size: int | None,
+    caption_font_color: str | None,
+    caption_box_color: str | None,
+    caption_box_opacity: float | None,
+    caption_highlight_color: str | None,
+    caption_padding_px: int | None,
+    caption_max_chars: int | None,
+    caption_max_lines: int | None,
+    caption_max_words: int | None,
+    caption_safe_zone_bottom_px: int | None,
+    caption_safe_zone_top_px: int | None,
+    caption_font_name: str | None,
+    caption_font_asset_id: str | None,
+    audio_target_lufs: float | None,
+    audio_lra: float | None,
+    audio_true_peak: float | None,
+    ducking_ratio: float | None,
+    ducking_threshold: float | None,
+    ducking_attack_ms: int | None,
+    ducking_release_ms: int | None,
+    music_gain: float | None,
+    voice_gain: float | None,
+    trim_silence: bool | None,
+    trim_silence_min_sec: float | None,
+    trim_silence_threshold_db: float | None,
+    cache_key: str | None = None,
+    job_id_override: str | None = None,
+) -> dict[str, Any]:
+    variables = {"quote": quote, "author": author}
+    return _render_marketing_job(
+        job_type="render_testimonial_clip",
+        template_name="testimonial_clip_basic",
+        primary_asset_id=primary_asset_id,
+        variables=variables,
+        brand_kit_id=brand_kit_id,
+        broll_asset_ids=broll_asset_ids,
+        voice_asset_id=voice_asset_id,
+        music_asset_id=music_asset_id,
+        captions_srt=captions_srt,
+        captions_vtt=captions_vtt,
+        words_json=words_json,
+        highlight_mode=highlight_mode,
+        include_16_9=include_16_9,
+        quality=quality,
+        framing_mode=framing_mode,
+        caption_position=caption_position,
+        caption_font_size=caption_font_size,
+        caption_font_color=caption_font_color,
+        caption_box_color=caption_box_color,
+        caption_box_opacity=caption_box_opacity,
+        caption_highlight_color=caption_highlight_color,
+        caption_padding_px=caption_padding_px,
+        caption_max_chars=caption_max_chars,
+        caption_max_lines=caption_max_lines,
+        caption_max_words=caption_max_words,
+        caption_safe_zone_bottom_px=caption_safe_zone_bottom_px,
+        caption_safe_zone_top_px=caption_safe_zone_top_px,
+        caption_font_name=caption_font_name,
+        caption_font_asset_id=caption_font_asset_id,
+        audio_target_lufs=audio_target_lufs,
+        audio_lra=audio_lra,
+        audio_true_peak=audio_true_peak,
+        ducking_ratio=ducking_ratio,
+        ducking_threshold=ducking_threshold,
+        ducking_attack_ms=ducking_attack_ms,
+        ducking_release_ms=ducking_release_ms,
+        music_gain=music_gain,
+        voice_gain=voice_gain,
+        trim_silence=trim_silence,
+        trim_silence_min_sec=trim_silence_min_sec,
+        trim_silence_threshold_db=trim_silence_threshold_db,
+        cache_key=cache_key,
+        job_id_override=job_id_override,
+    )
+
+
+def render_offer_card_job(
+    primary_asset_id: str,
+    headline: str | None,
+    price: str | None,
+    cta: str | None,
+    brand_kit_id: str | None,
+    broll_asset_ids: list[str] | None,
+    voice_asset_id: str | None,
+    music_asset_id: str | None,
+    captions_srt: str | None,
+    captions_vtt: str | None,
+    words_json: list[dict[str, Any]] | None,
+    highlight_mode: str | None,
+    include_16_9: bool | None,
+    quality: str | None,
+    framing_mode: str | None,
+    caption_position: str | None,
+    caption_font_size: int | None,
+    caption_font_color: str | None,
+    caption_box_color: str | None,
+    caption_box_opacity: float | None,
+    caption_highlight_color: str | None,
+    caption_padding_px: int | None,
+    caption_max_chars: int | None,
+    caption_max_lines: int | None,
+    caption_max_words: int | None,
+    caption_safe_zone_bottom_px: int | None,
+    caption_safe_zone_top_px: int | None,
+    caption_font_name: str | None,
+    caption_font_asset_id: str | None,
+    audio_target_lufs: float | None,
+    audio_lra: float | None,
+    audio_true_peak: float | None,
+    ducking_ratio: float | None,
+    ducking_threshold: float | None,
+    ducking_attack_ms: int | None,
+    ducking_release_ms: int | None,
+    music_gain: float | None,
+    voice_gain: float | None,
+    trim_silence: bool | None,
+    trim_silence_min_sec: float | None,
+    trim_silence_threshold_db: float | None,
+    cache_key: str | None = None,
+    job_id_override: str | None = None,
+) -> dict[str, Any]:
+    variables = {"headline": headline, "price": price, "cta": cta}
+    return _render_marketing_job(
+        job_type="render_offer_card",
+        template_name="offer_card_basic",
+        primary_asset_id=primary_asset_id,
+        variables=variables,
+        brand_kit_id=brand_kit_id,
+        broll_asset_ids=broll_asset_ids,
+        voice_asset_id=voice_asset_id,
+        music_asset_id=music_asset_id,
+        captions_srt=captions_srt,
+        captions_vtt=captions_vtt,
+        words_json=words_json,
+        highlight_mode=highlight_mode,
+        include_16_9=include_16_9,
+        quality=quality,
+        framing_mode=framing_mode,
+        caption_position=caption_position,
+        caption_font_size=caption_font_size,
+        caption_font_color=caption_font_color,
+        caption_box_color=caption_box_color,
+        caption_box_opacity=caption_box_opacity,
+        caption_highlight_color=caption_highlight_color,
+        caption_padding_px=caption_padding_px,
+        caption_max_chars=caption_max_chars,
+        caption_max_lines=caption_max_lines,
+        caption_max_words=caption_max_words,
+        caption_safe_zone_bottom_px=caption_safe_zone_bottom_px,
+        caption_safe_zone_top_px=caption_safe_zone_top_px,
+        caption_font_name=caption_font_name,
+        caption_font_asset_id=caption_font_asset_id,
+        audio_target_lufs=audio_target_lufs,
+        audio_lra=audio_lra,
+        audio_true_peak=audio_true_peak,
+        ducking_ratio=ducking_ratio,
+        ducking_threshold=ducking_threshold,
+        ducking_attack_ms=ducking_attack_ms,
+        ducking_release_ms=ducking_release_ms,
+        music_gain=music_gain,
+        voice_gain=voice_gain,
+        trim_silence=trim_silence,
+        trim_silence_min_sec=trim_silence_min_sec,
+        trim_silence_threshold_db=trim_silence_threshold_db,
+        cache_key=cache_key,
+        job_id_override=job_id_override,
+    )
+
+
+
+def _default_rubric_name(render_type: str) -> str:
+    if render_type == "testimonial_clip":
+        return "testimonial_v1"
+    return "social_reel_v1"
+
+
+def _primary_variant_preset(quality: str, framing_mode: str) -> str:
+    if framing_mode == "crop":
+        return "mp4_social_vertical_720x1280" if quality == "draft" else "mp4_social_vertical_1080x1920"
+    return "mp4_social_vertical_720x1280_safe_pad" if quality == "draft" else "mp4_social_vertical_1080x1920_safe_pad"
+
+
+def render_iterate_job(
+    render_type: str,
+    primary_asset_id: str,
+    hook: str | None,
+    headline: str | None,
+    cta: str | None,
+    price: str | None,
+    quote: str | None,
+    author: str | None,
+    brand_kit_id: str | None,
+    broll_asset_ids: list[str] | None,
+    voice_asset_id: str | None,
+    music_asset_id: str | None,
+    captions_srt: str | None,
+    captions_vtt: str | None,
+    words_json: list[dict[str, Any]] | None,
+    highlight_mode: str | None,
+    include_16_9: bool | None,
+    quality: str | None,
+    framing_mode: str | None,
+    caption_position: str | None,
+    caption_font_size: int | None,
+    caption_font_color: str | None,
+    caption_box_color: str | None,
+    caption_box_opacity: float | None,
+    caption_highlight_color: str | None,
+    caption_padding_px: int | None,
+    caption_max_chars: int | None,
+    caption_max_lines: int | None,
+    caption_max_words: int | None,
+    caption_safe_zone_bottom_px: int | None,
+    caption_safe_zone_top_px: int | None,
+    caption_font_name: str | None,
+    caption_font_asset_id: str | None,
+    audio_target_lufs: float | None,
+    audio_lra: float | None,
+    audio_true_peak: float | None,
+    ducking_ratio: float | None,
+    ducking_threshold: float | None,
+    ducking_attack_ms: int | None,
+    ducking_release_ms: int | None,
+    music_gain: float | None,
+    voice_gain: float | None,
+    trim_silence: bool | None,
+    trim_silence_min_sec: float | None,
+    trim_silence_threshold_db: float | None,
+    rubric_name: str | None,
+    pass_threshold: float | None,
+    max_iterations: int | None,
+    cache_key: str | None = None,
+    job_id_override: str | None = None,
+) -> dict[str, Any]:
+    job = get_current_job()
+    job_id = job_id_override if job_id_override is not None else (job.id if job else "")
+    start_ts = job_timer()
+    _log_job_started("render_iterate", job_id, primary_asset_id)
+    _finish_job(
+        job_id,
+        "running",
+        {"started_at": utc_now_iso(), "progress": 5, "cache_key": cache_key},
+    )
+
+    try:
+        render_type = (render_type or "").strip().lower()
+        if render_type not in {"social_ad", "testimonial_clip", "offer_card"}:
+            raise JobError("render_type must be social_ad, testimonial_clip, or offer_card")
+        quality = (quality or "final").strip().lower()
+        if quality not in {"final", "draft"}:
+            raise JobError("quality must be 'final' or 'draft'")
+
+        brand_kit = get_brand_kit(brand_kit_id) if brand_kit_id else None
+        if brand_kit_id and not brand_kit:
+            raise JobError("brand_kit_id not found")
+
+        caption_position = caption_position or (brand_kit.get("caption_position") if brand_kit else None)
+        caption_font_size = caption_font_size if caption_font_size is not None else (
+            brand_kit.get("caption_font_size") if brand_kit else settings.caption_font_size
+        )
+        caption_padding_px = caption_padding_px if caption_padding_px is not None else (
+            brand_kit.get("caption_padding_px") if brand_kit else settings.caption_padding_px
+        )
+        caption_max_chars = caption_max_chars if caption_max_chars is not None else (
+            brand_kit.get("caption_max_chars") if brand_kit else settings.caption_max_chars
+        )
+        caption_max_lines = caption_max_lines if caption_max_lines is not None else (
+            brand_kit.get("caption_max_lines") if brand_kit else settings.caption_max_lines
+        )
+        caption_max_words = caption_max_words if caption_max_words is not None else (
+            brand_kit.get("caption_max_words") if brand_kit else settings.caption_max_words
+        )
+        caption_safe_zone_bottom_px = caption_safe_zone_bottom_px if caption_safe_zone_bottom_px is not None else (
+            brand_kit.get("caption_safe_zone_bottom_px") if brand_kit else settings.caption_safe_zone_bottom_px
+        )
+        caption_safe_zone_top_px = caption_safe_zone_top_px if caption_safe_zone_top_px is not None else (
+            brand_kit.get("caption_safe_zone_top_px") if brand_kit else settings.caption_safe_zone_top_px
+        )
+
+        audio_target_lufs = audio_target_lufs if audio_target_lufs is not None else settings.audio_norm_i
+        audio_lra = audio_lra if audio_lra is not None else settings.audio_norm_lra
+        audio_true_peak = audio_true_peak if audio_true_peak is not None else settings.audio_norm_tp
+        ducking_ratio = ducking_ratio if ducking_ratio is not None else settings.ducking_ratio
+        ducking_threshold = ducking_threshold if ducking_threshold is not None else settings.ducking_threshold
+        ducking_attack_ms = ducking_attack_ms if ducking_attack_ms is not None else settings.ducking_attack_ms
+        ducking_release_ms = ducking_release_ms if ducking_release_ms is not None else settings.ducking_release_ms
+        music_gain = music_gain if music_gain is not None else settings.ducking_music_gain
+
+        trim_silence = bool(trim_silence) if trim_silence is not None else False
+        trim_silence_min_sec = (
+            float(trim_silence_min_sec)
+            if trim_silence_min_sec is not None
+            else settings.audio_min_silence_sec
+        )
+        trim_silence_threshold_db = (
+            float(trim_silence_threshold_db)
+            if trim_silence_threshold_db is not None
+            else settings.audio_silence_db
+        )
+
+        rubric_name = rubric_name or _default_rubric_name(render_type)
+        rubric = get_rubric(rubric_name)
+        threshold = float(pass_threshold) if pass_threshold is not None else float(rubric.get("pass_threshold", 85))
+        targets = rubric.get("targets", {})
+
+        max_iterations = int(max_iterations) if max_iterations is not None else 2
+        if max_iterations <= 0:
+            raise JobError("max_iterations must be > 0")
+
+        iterations: list[dict[str, Any]] = []
+        best_result: dict[str, Any] | None = None
+
+        for idx in range(max_iterations):
+            variables = {}
+            if render_type == "social_ad":
+                variables = {"hook": hook, "headline": headline, "cta": cta, "price": price}
+            elif render_type == "testimonial_clip":
+                variables = {"quote": quote, "author": author}
+            elif render_type == "offer_card":
+                variables = {"headline": headline, "price": price, "cta": cta}
+
+            render_result = _render_marketing_job(
+                job_type=f"render_iterate:{render_type}",
+                template_name={
+                    "social_ad": "social_ad_basic",
+                    "testimonial_clip": "testimonial_clip_basic",
+                    "offer_card": "offer_card_basic",
+                }[render_type],
+                primary_asset_id=primary_asset_id,
+                variables=variables,
+                brand_kit_id=brand_kit_id,
+                broll_asset_ids=broll_asset_ids,
+                voice_asset_id=voice_asset_id,
+                music_asset_id=music_asset_id,
+                captions_srt=captions_srt,
+                captions_vtt=captions_vtt,
+                words_json=words_json,
+                highlight_mode=highlight_mode,
+                include_16_9=include_16_9,
+                quality=quality,
+                framing_mode=framing_mode,
+                caption_position=caption_position,
+                caption_font_size=caption_font_size,
+                caption_font_color=caption_font_color,
+                caption_box_color=caption_box_color,
+                caption_box_opacity=caption_box_opacity,
+                caption_highlight_color=caption_highlight_color,
+                caption_padding_px=caption_padding_px,
+                caption_max_chars=caption_max_chars,
+                caption_max_lines=caption_max_lines,
+                caption_max_words=caption_max_words,
+                caption_safe_zone_bottom_px=caption_safe_zone_bottom_px,
+                caption_safe_zone_top_px=caption_safe_zone_top_px,
+                caption_font_name=caption_font_name,
+                caption_font_asset_id=caption_font_asset_id,
+                audio_target_lufs=audio_target_lufs,
+                audio_lra=audio_lra,
+                audio_true_peak=audio_true_peak,
+                ducking_ratio=ducking_ratio,
+                ducking_threshold=ducking_threshold,
+                ducking_attack_ms=ducking_attack_ms,
+                ducking_release_ms=ducking_release_ms,
+                music_gain=music_gain,
+                voice_gain=voice_gain,
+                trim_silence=trim_silence,
+                trim_silence_min_sec=trim_silence_min_sec,
+                trim_silence_threshold_db=trim_silence_threshold_db,
+                cache_key=None,
+                job_id_override="",
+            )
+
+            outputs = render_result.get("outputs", {}) if isinstance(render_result, dict) else {}
+            primary_variant = outputs.get("9x16") or next(iter(outputs.values()), {})
+            eval_asset_id = None
+            if captions_srt or captions_vtt or words_json:
+                eval_asset_id = primary_variant.get("captioned")
+            if not eval_asset_id:
+                eval_asset_id = primary_variant.get("non_captioned")
+            if not eval_asset_id:
+                eval_asset_id = (render_result.get("output_asset_ids") or [None])[0]
+
+            target_preset = _primary_variant_preset(quality, framing_mode or "safe_pad")
+            analysis = video_analyze_job(
+                eval_asset_id,
+                rubric_name,
+                target_preset,
+                captions_srt,
+                captions_vtt,
+                words_json,
+                brand_kit_id,
+                caption_position,
+                caption_font_size,
+                caption_padding_px,
+                caption_max_chars,
+                caption_max_lines,
+                caption_max_words,
+                caption_safe_zone_bottom_px,
+                caption_safe_zone_top_px,
+                cache_key=None,
+                job_id_override="",
+            )
+            rubric_report = analysis.get("rubric", {}) if isinstance(analysis, dict) else {}
+            score = rubric_report.get("score")
+
+            iterations.append(
+                {
+                    "iteration": idx + 1,
+                    "score": score,
+                    "outputs": outputs,
+                    "analysis": analysis,
+                    "settings": {
+                        "framing_mode": framing_mode,
+                        "caption_max_chars": caption_max_chars,
+                        "caption_max_lines": caption_max_lines,
+                        "caption_max_words": caption_max_words,
+                        "caption_font_size": caption_font_size,
+                        "caption_safe_zone_bottom_px": caption_safe_zone_bottom_px,
+                        "audio_target_lufs": audio_target_lufs,
+                        "audio_true_peak": audio_true_peak,
+                        "ducking_ratio": ducking_ratio,
+                        "music_gain": music_gain,
+                        "trim_silence": trim_silence,
+                    },
+                }
+            )
+
+            if score is not None and score >= threshold:
+                best_result = iterations[-1]
+                break
+
+            video_metrics = analysis.get("video", {}) if isinstance(analysis, dict) else {}
+            audio_metrics = analysis.get("audio", {}) if isinstance(analysis, dict) else {}
+            caption_metrics = analysis.get("captions", {}) if isinstance(analysis, dict) else {}
+
+            if (
+                video_metrics.get("black_frames_pct") is not None
+                and video_metrics.get("black_frames_pct") > targets.get("black_frames_pct_max", 1.0)
+                and framing_mode == "safe_pad"
+            ):
+                framing_mode = "crop"
+
+            if caption_metrics.get("safe_zone_violations"):
+                caption_safe_zone_bottom_px = int(caption_safe_zone_bottom_px or settings.caption_safe_zone_bottom_px) + 16
+
+            readability = caption_metrics.get("caption_readability_score")
+            if readability is not None and readability < targets.get("caption_readability_min", 70.0):
+                caption_max_chars = max(40, int(caption_max_chars) - 6)
+                caption_max_words = max(6, int(caption_max_words) - 1)
+                caption_max_lines = min(3, int(caption_max_lines) + 1)
+                caption_font_size = max(settings.min_font_size, int(caption_font_size) - 2)
+
+            speed_wpm = caption_metrics.get("caption_speed_wpm")
+            if speed_wpm and speed_wpm > targets.get("caption_speed_wpm_max", 180.0):
+                caption_max_words = max(5, int(caption_max_words) - 1)
+
+            loudness = audio_metrics.get("loudness_lufs")
+            if loudness is not None:
+                target_lufs = float(targets.get("loudness_lufs", -16.0))
+                tolerance = float(targets.get("loudness_tolerance", 2.5))
+                if loudness < target_lufs - tolerance:
+                    audio_target_lufs = min(-12.0, float(audio_target_lufs) + 1.0)
+                elif loudness > target_lufs + tolerance:
+                    audio_target_lufs = max(-23.0, float(audio_target_lufs) - 1.0)
+
+            true_peak = audio_metrics.get("true_peak_db")
+            if true_peak is not None and true_peak > targets.get("true_peak_max_db", -1.5):
+                audio_true_peak = min(float(audio_true_peak), targets.get("true_peak_max_db", -1.5))
+                music_gain = max(0.4, float(music_gain) - 0.05)
+
+            silence_pct = audio_metrics.get("silence_pct")
+            if silence_pct is not None and silence_pct > targets.get("silence_pct_max", 5.0) and voice_asset_id:
+                trim_silence = True
+                trim_silence_min_sec = max(0.2, float(trim_silence_min_sec) - 0.1)
+                trim_silence_threshold_db = min(-20.0, float(trim_silence_threshold_db) + 2.0)
+
+            update_job(
+                job_id,
+                {
+                    "progress": 5 + int(90 * ((idx + 1) / max_iterations)),
+                    "updated_at": utc_now_iso(),
+                },
+            )
+
+        if best_result is None and iterations:
+            best_result = max(iterations, key=lambda item: item.get("score") or 0)
+
+        result_payload = {
+            "rubric_name": rubric_name,
+            "pass_threshold": threshold,
+            "iterations": iterations,
+            "best": best_result,
+        }
+        _finish_job(
+            job_id,
+            "success",
+            {
+                "output_asset_ids": [best_result.get("analysis", {}).get("asset_id")] if best_result else [],
+                "result": result_payload,
+                "logs_short": "iteration complete",
+                "finished_at": utc_now_iso(),
+            },
+        )
+        _record_job_metrics("render_iterate", start_ts, "success", job_id)
+        if cache_key:
+            set_cached_result(
+                cache_key,
+                {
+                    "output_asset_ids": [best_result.get("analysis", {}).get("asset_id")] if best_result else [],
+                    "created_at": utc_now_iso(),
+                    "job_type": "render_iterate",
+                    "result": result_payload,
+                },
+                settings.asset_ttl_seconds(),
+            )
+        return result_payload
+    except (FfmpegError, JobError, ValueError) as exc:
+        _finish_job(
+            job_id,
+            "error",
+            {"error": str(exc), "logs_short": None, "finished_at": utc_now_iso()},
+        )
+        _record_job_metrics("render_iterate", start_ts, "error", job_id)
         raise
