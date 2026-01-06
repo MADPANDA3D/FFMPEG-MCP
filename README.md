@@ -233,7 +233,7 @@ One-shot renders (captioned + non-captioned variants when captions are supplied)
 Defaults:
 - Variants: 9:16 + 1:1 + 4:5 (set `include_16_9=true` for 16:9)
 - Inputs: `primary_asset_id` required; optional `broll_asset_ids`, `voice_asset_id`, `music_asset_id`
-- Quality: `quality=draft|final` (draft uses 720p presets and optional watermark)
+- Quality: `quality=draft|final` (draft uses 720p presets and watermark by default)
 
 Caption inputs: pass `captions_srt`, `captions_vtt`, or `words_json` to generate captioned outputs.
 Iteration constraints: `lock_framing`, `lock_captions`, `lock_audio`, `allow_trim_silence`.
@@ -248,7 +248,7 @@ Iteration strategy/bounds (render_iterate): `strategy` (`captions_first|audio_fi
 - `asset_compare` ranks assets by rubric score.
 - `rubric_list` / `rubric_describe` expose scoring profiles.
 - Rubrics include `social_reel_v1`, `testimonial_v1`, `insta_reel_v1`, `youtube_short_v1`.
-- `job_status` includes `qa` (pass/score/failed_checks/recommended_fix) plus
+- `job_status` includes `qa` (pass/score/failed_checks/failed_checks_codes/recommended_fix) plus
   `report` (analyze), `ranking` (compare), and `result` (iterate).
 - `qa.fingerprint` hashes rubric + targets + overrides for reproducibility.
 - `render_iterate` includes `iterations[].changes` for compact diffs.

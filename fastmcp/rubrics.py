@@ -374,6 +374,15 @@ def score_report(
     }
 
 
+def _qa_code(key: str) -> str:
+    if not key:
+        return "QA_UNKNOWN"
+    cleaned = re.sub(r"[^a-zA-Z0-9]+", "_", key).strip("_")
+    if not cleaned:
+        return "QA_UNKNOWN"
+    return f"QA_{cleaned.upper()}"
+
+
 def qa_from_report(
     report: dict[str, Any],
     rubric: dict[str, Any],
@@ -385,17 +394,20 @@ def qa_from_report(
             "pass": None,
             "score": None,
             "failed_checks": [],
+            "failed_checks_codes": [],
             "recommended_fix": None,
             "fingerprint": None,
         }
     scored = score_report(report, rubric, target_preset)
     failures = _find_failures(report, rubric, target_preset)
     failed_checks = [item["reason"] for item in failures[:3]]
+    failed_checks_codes = [_qa_code(item.get("key", "")) for item in failures[:3]]
     recommended_fix = failures[0]["fix"] if failures else None
     return {
         "pass": scored.get("passed"),
         "score": scored.get("score"),
         "failed_checks": failed_checks,
+        "failed_checks_codes": failed_checks_codes,
         "recommended_fix": recommended_fix,
         "fingerprint": qa_fingerprint(rubric, target_preset, overrides),
     }

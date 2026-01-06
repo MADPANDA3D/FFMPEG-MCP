@@ -209,7 +209,7 @@ class Settings:
     draft_crf: int = _get_int("DRAFT_CRF", 28)
     draft_preset: str = _get_env("DRAFT_PRESET", "ultrafast")
     draft_audio_bitrate: str = _get_env("DRAFT_AUDIO_BITRATE", "96k")
-    draft_watermark_enabled: bool = _get_bool("DRAFT_WATERMARK_ENABLED", False)
+    draft_watermark_enabled: bool = _get_bool("DRAFT_WATERMARK_ENABLED", True)
     draft_watermark_text: str = _get_env("DRAFT_WATERMARK_TEXT", "DRAFT")
     draft_watermark_opacity: float = _get_float("DRAFT_WATERMARK_OPACITY", 0.35)
     draft_watermark_font_size: int = _get_int("DRAFT_WATERMARK_FONT_SIZE", 48)

@@ -57,6 +57,37 @@ class JobError(RuntimeError):
     pass
 
 
+ITERATE_STRATEGIES = ("balanced", "captions_first", "audio_first", "framing_first")
+
+FAIL_FAST_ERRORS = {
+    "no_video_track": {
+        "code": "ERR_NO_VIDEO_TRACK",
+        "reason": "missing video track",
+        "fix": "use a valid video source",
+    },
+    "no_audio_track": {
+        "code": "ERR_NO_AUDIO_TRACK",
+        "reason": "missing audio track",
+        "fix": "check audio inputs",
+    },
+    "duration_too_short": {
+        "code": "ERR_DURATION_TOO_SHORT",
+        "reason": "duration below minimum",
+        "fix": "use a longer source clip",
+    },
+    "resolution_too_low": {
+        "code": "ERR_RES_TOO_LOW",
+        "reason": "resolution below target",
+        "fix": "use higher-resolution media",
+    },
+    "captions_empty": {
+        "code": "ERR_CAPTIONS_EMPTY",
+        "reason": "captions empty or unparsable",
+        "fix": "check caption input format",
+    },
+}
+
+
 def _hash_file(path: str) -> str:
     hasher = hashlib.sha256()
     with open(path, "rb") as handle:
@@ -5241,8 +5272,9 @@ def render_iterate_job(
         )
 
         strategy = (strategy or "balanced").strip().lower()
-        if strategy not in {"balanced", "captions_first", "audio_first", "framing_first"}:
-            raise JobError("strategy must be balanced, captions_first, audio_first, or framing_first")
+        if strategy not in ITERATE_STRATEGIES:
+            allowed = ", ".join(ITERATE_STRATEGIES)
+            raise JobError(f"strategy must be {allowed}")
 
         caption_font_size_min = int(caption_font_size_min) if caption_font_size_min is not None else settings.auto_caption_font_size_min
         caption_font_size_max = int(caption_font_size_max) if caption_font_size_max is not None else settings.auto_caption_font_size_max
@@ -5462,22 +5494,23 @@ def render_iterate_job(
                 has_audio = audio_metrics.get("has_audio")
                 has_video = video_metrics.get("has_video")
                 if has_video is False:
-                    fatal_checks.append({"reason": "missing video track", "fix": "use a valid video source"})
+                    fatal_checks.append(dict(FAIL_FAST_ERRORS["no_video_track"]))
                 if (voice_asset_id or music_asset_id) and has_audio is False:
-                    fatal_checks.append({"reason": "missing audio track", "fix": "check audio inputs"})
+                    fatal_checks.append(dict(FAIL_FAST_ERRORS["no_audio_track"]))
                 duration_sec = analysis.get("duration_sec") if isinstance(analysis, dict) else None
                 if duration_sec is not None and min_duration_sec > 0 and float(duration_sec) < min_duration_sec:
-                    fatal_checks.append({"reason": "duration below minimum", "fix": "use a longer source clip"})
+                    fatal_checks.append(dict(FAIL_FAST_ERRORS["duration_too_short"]))
                 if video_metrics.get("resolution_ok") is False:
-                    fatal_checks.append({"reason": "resolution below target", "fix": "use higher-resolution media"})
+                    fatal_checks.append(dict(FAIL_FAST_ERRORS["resolution_too_low"]))
                 if (captions_srt or captions_vtt or words_json) and caption_metrics.get("segment_count") in {0, None}:
-                    fatal_checks.append({"reason": "captions empty or unparsable", "fix": "check caption input format"})
+                    fatal_checks.append(dict(FAIL_FAST_ERRORS["captions_empty"]))
             if fatal_checks:
                 qa = analysis.get("qa") if isinstance(analysis, dict) else None
                 if not isinstance(qa, dict):
                     qa = qa_from_report(analysis, rubric, target_preset)
                 qa["pass"] = False
                 qa["failed_checks"] = [item["reason"] for item in fatal_checks[:3]]
+                qa["failed_checks_codes"] = [item["code"] for item in fatal_checks[:3]]
                 qa["recommended_fix"] = fatal_checks[0]["fix"]
                 analysis["qa"] = qa
                 iterations[-1]["analysis"] = analysis

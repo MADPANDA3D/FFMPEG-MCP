@@ -50,6 +50,7 @@ from jobs import (
     video_add_text_job,
     video_analyze_job,
     workflow_job,
+    ITERATE_STRATEGIES,
 )
 from metrics import collect_metrics_snapshot, log_event, record_cache_hit, record_cache_miss
 from overlay_utils import (
@@ -306,6 +307,8 @@ def _last_log_line(logs: str | None) -> str | None:
 def _derive_qa(job_record: dict) -> dict:
     qa = job_record.get("qa")
     if isinstance(qa, dict):
+        if "failed_checks_codes" not in qa:
+            qa = {**qa, "failed_checks_codes": []}
         return qa
 
     report = job_record.get("report")
@@ -348,7 +351,14 @@ def _derive_qa(job_record: dict) -> dict:
                     if rubric:
                         return qa_from_report(analysis, rubric, analysis.get("target_preset"))
 
-    return {"pass": None, "score": None, "failed_checks": [], "recommended_fix": None, "fingerprint": None}
+    return {
+        "pass": None,
+        "score": None,
+        "failed_checks": [],
+        "failed_checks_codes": [],
+        "recommended_fix": None,
+        "fingerprint": None,
+    }
 
 
 def _build_cache_key(job_type: str, payload: dict) -> str:
@@ -2708,6 +2718,7 @@ async def tool_capabilities() -> dict:
             "caption_safe_zone_bottom_px": settings.caption_safe_zone_bottom_px,
             "caption_safe_zone_top_px": settings.caption_safe_zone_top_px,
             "caption_safe_zone_profiles": sorted(SAFE_ZONE_PROFILES.keys()),
+            "iterate_strategies": list(ITERATE_STRATEGIES),
             "auto_caption_font_size_min": settings.auto_caption_font_size_min,
             "auto_caption_font_size_max": settings.auto_caption_font_size_max,
             "auto_caption_box_opacity_min": settings.auto_caption_box_opacity_min,
@@ -2840,6 +2851,7 @@ async def tool_job_status(job_id: str) -> dict:
                 "pass": None,
                 "score": None,
                 "failed_checks": [],
+                "failed_checks_codes": [],
                 "recommended_fix": None,
                 "fingerprint": None,
             },
