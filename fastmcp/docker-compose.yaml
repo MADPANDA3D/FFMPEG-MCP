@@ -1,0 +1,41 @@
+services:
+  ffmpeg-mcp:
+    container_name: ffmpeg-mcp
+    build: .
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      MCP_HTTP_PORT: "8087"
+    ports:
+      - "8087:8087"
+    volumes:
+      - ./data:/data
+    depends_on:
+      - redis
+    networks:
+      - npm_default
+
+  ffmpeg-mcp-worker:
+    container_name: ffmpeg-mcp-worker
+    build: .
+    restart: unless-stopped
+    env_file:
+      - .env
+    command: ["python", "worker.py"]
+    volumes:
+      - ./data:/data
+    depends_on:
+      - redis
+    networks:
+      - npm_default
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    networks:
+      - npm_default
+
+networks:
+  npm_default:
+    external: true

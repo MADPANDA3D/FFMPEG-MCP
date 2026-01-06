@@ -1,0 +1,12 @@
+# Local env
+fastmcp/.env
+
+# Local data/cache
+fastmcp/data/
+
+# Python
+__pycache__/
+*.pyc
+
+# OS
+.DS_Store
