@@ -1,36 +1,65 @@
-# FFMPEG MCP (FastMCP)
+<p align="center">
+  <img src="./assets/brand/header.jpg" alt="FFmpeg MCP Server header" />
+</p>
 
-Preset-driven FFmpeg MCP server with async jobs, staging storage, and signed
-download URLs. Built to match the Google/Discord MCP deployment style on VPS.
+<p align="center">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="MIT License" /></a>
+  <a href="https://www.python.org/"><img src="https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white" alt="Python 3.11+" /></a>
+  <a href="https://modelcontextprotocol.io/"><img src="https://img.shields.io/badge/MCP-Server-000000" alt="MCP Server" /></a>
+  <a href="https://ffmpeg.org/"><img src="https://img.shields.io/badge/FFmpeg-enabled-000000?logo=ffmpeg&logoColor=white" alt="FFmpeg" /></a>
+  <a href="https://github.com/MADPANDA3D/FFMPEG-MCP/releases"><img src="https://img.shields.io/github/v/release/MADPANDA3D/FFMPEG-MCP?display_name=tag&color=0e8a16" alt="release" /></a>
+  <a href="https://github.com/MADPANDA3D/FFMPEG-MCP/issues"><img src="https://img.shields.io/github/issues/MADPANDA3D/FFMPEG-MCP?color=ff8c00" alt="open issues" /></a>
+  <a href="https://github.com/MADPANDA3D/FFMPEG-MCP"><img src="https://img.shields.io/github/stars/MADPANDA3D/FFMPEG-MCP?color=f1c40f" alt="stars" /></a>
+</p>
 
-## What you get
+<h1 align="center">FFmpeg MCP (FastMCP)</h1>
+
+<p align="center">Preset-driven FFmpeg MCP server with async jobs, staging storage, and signed downloads.</p>
+
+## Overview
+
+FFMPEG MCP is a FastMCP service that runs FFmpeg jobs asynchronously with strict presets, safe ingest rules, and signed download URLs. It is designed for production workflows, marketing pipelines, and agent-driven media processing on a VPS.
+
+## Status
+
+- Stage: stable
+- Maintainer: MADPANDA3D
+- Support: GitHub issues
+
+## Quick Start
+
+```bash
+cd fastmcp
+cp .env.example .env
+
+docker-compose -f fastmcp/docker-compose.yaml up -d --build
+```
+
+## Features
 
 - FastMCP HTTP server + async worker (RQ + Redis)
 - URL ingest with allowlist, magic-byte validation, size/duration caps
 - Preset-only FFmpeg operations (no arbitrary flags)
-- Marketing-focused presets (social crops, safe pads, audio normalization, text placeholders)
-- Text + logo overlays (drawtext + watermark) via async jobs
-- Caption burn-in + one-shot marketing render tools
-- Rubrics + analyze/iterate/compare for closed-loop quality
-- Templates + Brand Kits for one-call marketing outputs
+- Marketing presets, overlays, captions, and templates
 - Batch exports, campaign processing, and workflow chaining
 - Signed download URLs (`/download/{asset_id}`)
 - Optional exports to Drive and Discord
 - `ffmpeg_capabilities` self-description endpoint
 
-## Setup
+## Tech Stack
 
-### 1) Configure env
+- Runtime: Python 3.11+
+- Media: FFmpeg + FFprobe
+- Queue: RQ + Redis
+- MCP: FastMCP
+- Storage: local or S3-compatible
 
-```bash
-cd fastmcp
-cp .env.example .env
-```
+## Configuration
 
 Important defaults:
 - `MCP_HTTP_PORT=8087`
 - `PUBLIC_BASE_URL=https://ffmpeg-mcp.yourdomain.com`
-- `DOWNLOAD_SIGNING_SECRET=...` (required for local signed URLs)
+- `DOWNLOAD_SIGNING_SECRET=...` (required for signed URLs)
 - `STORAGE_BACKEND=local` (or `s3`)
 - `ALLOWED_DOMAINS=cdn.discordapp.com,media.discordapp.net,googleusercontent.com,...`
 - `MAX_INGEST_BYTES`, `MAX_OUTPUT_BYTES`, `MAX_DURATION_SECONDS`
@@ -38,13 +67,7 @@ Important defaults:
 - `LOGO_DIR` for logo overlays (`logo_key` values)
 - `ALLOW_IMAGE_INGEST=true` for image tools
 - `SOCIAL_PRESETS=...` for batch social exports
-- `QUEUE_NAME_URGENT`, `QUEUE_NAME_BATCH` for priority queues (optional)
-
-### 2) Run the server
-
-```bash
-docker-compose -f fastmcp/docker-compose.yaml up -d --build
-```
+- `QUEUE_NAME_URGENT`, `QUEUE_NAME_BATCH` for priority queues
 
 ## Connect to n8n
 
@@ -60,30 +83,29 @@ External:
 http://<vps-ip>:8087/mcp
 ```
 
-## VPS Deployment (Nginx Proxy Manager)
+## Deployment (Nginx Proxy Manager)
 
-Attach the container to `npm_default` (already done in compose).
-
-NPM host settings:
+- Attach the container to `npm_default` (already in compose).
 - Forward Hostname/IP: `ffmpeg-mcp`
 - Forward Port: `8087`
 - Websockets: ON
 - HTTP/2: OFF
+- Allow `/download/` paths (signed URL delivery).
 
-Also allow `/download/` paths (signed URL delivery).
+## Tool Modes
 
-## Tool modes (agent vs n8n)
-
-Default is individual tools:
+Default tools:
 - `MCP_TOOL_MODE=individual`
-- Tools are listed as `media_ingest_from_url`, `ffmpeg_transcode`, etc.
 
-Single wrapper mode (for agents expecting a single tool):
+Single wrapper mode:
 - `MCP_TOOL_MODE=router`
-- Only tool exposed: `FFMPEG_MCP`
+- Tool exposed: `FFMPEG_MCP`
 - Call with `{ "tool": "<tool_name>", "arguments": { ... } }`
 
-## Tools (individual mode)
+## Tool Catalog
+
+<details>
+<summary>Tools (individual mode)</summary>
 
 Ingest + storage:
 - `media_ingest_from_url`
@@ -151,12 +173,13 @@ Meta:
 - `job_logs`
 - `metrics_snapshot`
 
+</details>
+
 ## Presets
 
-Start with `ffmpeg_list_presets` or `ffmpeg_capabilities` for the full list.
-Use `ffmpeg_describe_preset(name)` for safe profile details.
+<details>
+<summary>Sample presets</summary>
 
-Sample presets:
 - `mp4_web_720p_small`
 - `mp4_social_vertical_1080x1920_safe_pad`
 - `mp4_social_portrait_1080x1350`
@@ -167,19 +190,23 @@ Sample presets:
 - `wav_pcm_16k_mono`
 - `gif_preview_lowfps`
 
-## Overlay tools
+</details>
+
+## Overlays
+
+<details>
+<summary>Text + logo overlays</summary>
 
 Text overlay (`video_add_text`):
 - Required: `asset_id`, `text`
-- Optional: `position` (`top|center|bottom`), `font_size`, `font_color`,
-  `background_box`, `box_color`, `box_border_width`, `font_name`, `font_asset_id`
+- Optional: `position`, `font_size`, `font_color`, `background_box`, `box_color`,
+  `box_border_width`, `font_name`, `font_asset_id`
 
 Logo overlay (`video_add_logo`):
 - Required: `asset_id`, `logo_asset_id` or `logo_key`
-- Optional: `position` (`top-left|top-right|bottom-left|bottom-right`),
-  `scale_pct`, `opacity`
+- Optional: `position`, `scale_pct`, `opacity`
 
-Examples (router mode):
+Example (router mode):
 
 ```json
 {
@@ -194,78 +221,55 @@ Examples (router mode):
 }
 ```
 
-```json
-{
-  "tool": "video_add_logo",
-  "arguments": {
-    "asset_id": "ASSET_ID",
-    "logo_key": "brand.png",
-    "position": "bottom-right",
-    "scale_pct": 15,
-    "opacity": 0.9
-  }
-}
-```
-
-Notes:
-- `font_name` is resolved from `FONT_DIRS` (and `FONT_ALLOWLIST` if set).
-- `logo_key` is resolved from `LOGO_DIR` (and `LOGO_ALLOWLIST` if set).
-- Async tools accept optional `priority` (`urgent`, `batch`, or default) if queues are configured.
+</details>
 
 ## Captions
 
-Burn-in captions (`captions_burn_in`):
+<details>
+<summary>Caption burn-in</summary>
+
 - Required: `asset_id` plus one of `captions_srt`, `captions_vtt`, or `words_json`
-- `words_json` shape: `[{ "word": "Hello", "start": 1.23, "end": 1.56 }]` (seconds)
-- Optional: `brand_kit_id`, `highlight_mode="word"`, `position`, `font_size`, `font_color`,
-  `box_color`, `box_opacity`, `padding_px`, `max_chars`, `max_lines`, `max_words`,
-  `safe_zone_bottom_px`, `safe_zone_top_px`, `safe_zone_profile`, `font_name`, `font_asset_id`
-  (`safe_zone_profile`: `tiktok|reels|shorts`)
+- `words_json` shape: `[{ "word": "Hello", "start": 1.23, "end": 1.56 }]`
+- Supports `brand_kit_id`, `highlight_mode`, `position`, `font_size`, `font_color`,
+  `box_color`, `box_opacity`, `padding_px`, `safe_zone_profile` and more
 
-## Marketing render tools
+</details>
 
-One-shot renders (captioned + non-captioned variants when captions are supplied):
+## Marketing Render Tools
+
+<details>
+<summary>Render + iterate</summary>
+
+One-shot renders:
 - `render_social_ad`
 - `render_testimonial_clip`
 - `render_offer_card`
-- `render_iterate` (render + analyze + auto-tune until rubric threshold)
+- `render_iterate`
 
 Defaults:
 - Variants: 9:16 + 1:1 + 4:5 (set `include_16_9=true` for 16:9)
 - Inputs: `primary_asset_id` required; optional `broll_asset_ids`, `voice_asset_id`, `music_asset_id`
-- Quality: `quality=draft|final` (draft uses 720p presets and watermark by default)
+- Quality: `quality=draft|final`
 
-Caption inputs: pass `captions_srt`, `captions_vtt`, or `words_json` to generate captioned outputs.
-Iteration constraints: `lock_framing`, `lock_captions`, `lock_audio`, `allow_trim_silence`.
-Iteration strategy/bounds (render_iterate): `strategy` (`captions_first|audio_first|framing_first|balanced`),
-`caption_font_size_min/max`, `caption_box_opacity_min/max`, `music_gain_min/max`,
-`max_crop_pct`, `min_duration_sec`, `fail_fast`.
+</details>
 
 ## Analysis + QA
 
+<details>
+<summary>Rubrics and scoring</summary>
+
 - `video_analyze` returns audio/video/caption metrics with optional rubric scoring.
-- `video_analyze` accepts `reference_asset_id` to return deltas vs a golden reference.
 - `asset_compare` ranks assets by rubric score.
-- `rubric_list` / `rubric_describe` expose scoring profiles.
 - Rubrics include `social_reel_v1`, `testimonial_v1`, `insta_reel_v1`, `youtube_short_v1`.
-- `job_status` includes `qa` (pass/score/failed_checks/failed_checks_codes/recommended_fix) plus
-  `report` (analyze), `ranking` (compare), and `result` (iterate).
-- `qa.fingerprint` hashes rubric + targets + overrides for reproducibility.
-- `render_iterate` includes `iterations[].changes` for compact diffs.
 
-## Templates
+</details>
 
-List and apply:
-- `template_list`
-- `template_describe`
-- `template_apply`
+## Templates + Brand Kits
 
-Notes:
-- `template_describe` returns a schema (required fields, defaults, max chars).
-- `template_apply` accepts `quality=draft|final` to map to draft presets.
-- `campaign_process` accepts `quality=draft|final` to map presets for draft outputs.
+<details>
+<summary>Templates and branding</summary>
 
-Example:
+Example template apply:
 
 ```json
 {
@@ -283,9 +287,7 @@ Example:
 }
 ```
 
-## Brand kits
-
-Create or update:
+Example brand kit:
 
 ```json
 {
@@ -304,22 +306,12 @@ Create or update:
 }
 ```
 
-Apply:
+</details>
 
-```json
-{
-  "tool": "brand_kit_apply",
-  "arguments": {
-    "asset_id": "ASSET_ID",
-    "brand_kit_id": "acme",
-    "text": "Acme Co"
-  }
-}
-```
+## Batch + Workflows
 
-## Batch + workflows
-
-Batch exports:
+<details>
+<summary>Batch exports and workflows</summary>
 
 ```json
 {
@@ -329,21 +321,6 @@ Batch exports:
   }
 }
 ```
-
-Campaign:
-
-```json
-{
-  "tool": "campaign_process",
-  "arguments": {
-    "asset_ids": ["A1", "A2"],
-    "template_name": "promo_vertical_basic",
-    "brand_kit_id": "acme"
-  }
-}
-```
-
-Workflow:
 
 ```json
 {
@@ -360,24 +337,89 @@ Workflow:
 }
 ```
 
-## Example curl flow
+</details>
+
+## Example curl Flow
+
+<details>
+<summary>Initialize and list tools</summary>
 
 ```bash
-# 1) Initialize MCP session
 curl -i -X POST http://localhost:8087/mcp \
   -H "Content-Type: application/json" \
   -H "Accept: application/json, text/event-stream" \
   -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}'
 
-# 2) List tools
 curl -i -X POST http://localhost:8087/mcp \
   -H "Content-Type: application/json" \
   -H "Accept: application/json, text/event-stream" \
   -d '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}'
 ```
 
+</details>
+
 ## Notes
 
 - Allowlist failures return explicit host lists for faster debugging.
 - `job_status` returns progress, logs, and cache hit status.
 - Signed URLs require `PUBLIC_BASE_URL` + `DOWNLOAD_SIGNING_SECRET`.
+
+## License
+
+MIT.
+
+## Support
+
+[![Donate to the Project](https://img.shields.io/badge/Donate_to_the_Project-Support_Development-ff69b4?style=for-the-badge&logo=heart&logoColor=white)](https://donate.stripe.com/cNidRbdkAbdP8iU7SD4ko0b)
+
+## Affiliate Links
+
+<details>
+<summary>Services I use (affiliate)</summary>
+
+Using these links helps support continued development.
+
+### Hostinger VPS
+- [KVM 1](https://www.hostinger.com/cart?product=vps%3Avps_kvm_1&period=12&referral_type=cart_link&REFERRALCODE=ZUWMADPANOFE&referral_id=0199a491-d783-7057-85d2-27de6e01e2c5)
+- [KVM 2](https://www.hostinger.com/cart?product=vps%3Avps_kvm_2&period=12&referral_type=cart_link&REFERRALCODE=ZUWMADPANOFE&referral_id=0199a492-26cf-7333-b6d7-692e17bf8ce1)
+- [KVM 4](https://www.hostinger.com/cart?product=vps%3Avps_kvm_4&period=12&referral_type=cart_link&REFERRALCODE=ZUWMADPANOFE&referral_id=0199a492-531e-70d3-83f5-e28eb919466d)
+- [KVM 8](https://www.hostinger.com/cart?product=vps%3Avps_kvm_8&period=12&referral_type=cart_link&REFERRALCODE=ZUWMADPANOFE&referral_id=0199a492-7ce9-70fb-b96c-2184abc56764)
+
+### Cloud Hosting
+- [Cloud Economy](https://www.hostinger.com/cart?product=hosting%3Acloud_economy&period=12&referral_type=cart_link&REFERRALCODE=ZUWMADPANOFE&referral_id=0199a48f-e7fa-7358-9ff0-f9ba2e8d6e36)
+- [Cloud Professional](https://www.hostinger.com/cart?product=hosting%3Acloud_professional&period=12&referral_type=cart_link&REFERRALCODE=ZUWMADPANOFE&referral_id=0199a490-20fd-70bc-959e-a1f2cd9a69a6)
+- [Cloud Enterprise](https://www.hostinger.com/cart?product=hosting%3Acloud_enterprise&period=12&referral_type=cart_link&REFERRALCODE=ZUWMADPANOFE&referral_id=0199a490-5972-72e4-850f-40d618988dc1)
+
+### Web Hosting
+- [Premium](https://www.hostinger.com/cart?product=hosting%3Ahostinger_premium&period=12&referral_type=cart_link&REFERRALCODE=ZUWMADPANOFE&referral_id=0199a48f-4c21-7199-9918-8f31a3f6a0d9)
+- [Business](https://www.hostinger.com/cart?product=hosting%3Ahostinger_business&period=12&referral_type=cart_link&REFERRALCODE=ZUWMADPANOFE&referral_id=0199a48f-1135-72ba-acbb-13e0e7550db0)
+
+### Website Builder
+- [Premium](https://www.hostinger.com/cart?product=hosting%3Ahostinger_premium&period=12&referral_type=cart_link&REFERRALCODE=ZUWMADPANOFE&referral_id=0199a492-f240-7309-b3fe-9f6909fbc769&product_type=website-builder)
+- [Business](https://www.hostinger.com/cart?product=hosting%3Ahostinger_business&period=12&referral_type=cart_link&REFERRALCODE=ZUWMADPANOFE&referral_id=0199a492-7ce9-70fb-b96c-2184abc56764)
+
+### Agency Hosting
+- [Startup](https://www.hostinger.com/cart?product=hosting%3Aagency_startup&period=12&referral_type=cart_link&REFERRALCODE=ZUWMADPANOFE&referral_id=0199a490-d03c-71de-9acf-08fd4fa911de)
+- [Growth](https://www.hostinger.com/cart?product=hosting%3Aagency_growth&period=12&referral_type=cart_link&REFERRALCODE=ZUWMADPANOFE&referral_id=0199a491-6af4-731f-8947-f1458f07fa5b)
+- [Professional](https://www.hostinger.com/cart?product=hosting%3Aagency_professional&period=12&referral_type=cart_link&REFERRALCODE=ZUWMADPANOFE&referral_id=0199a491-03fb-73f8-9910-044a0a33393a)
+
+### Email
+- [Business Pro](https://www.hostinger.com/cart?product=hostinger_mail%3Apro&period=12&referral_type=cart_link&REFERRALCODE=ZUWMADPANOFE&referral_id=0199a493-5c27-727b-b7f9-8747ffb4e5ee)
+- [Business Premium](https://www.hostinger.com/cart?product=hostinger_mail%3Apremium&period=12&referral_type=cart_link&REFERRALCODE=ZUWMADPANOFE&referral_id=0199a493-a3fc-72b8-a961-94ed6e1c70e6)
+
+### Reach
+- [Reach 500](https://www.hostinger.com/cart?product=reach%3A500&period=12&referral_type=cart_link&REFERRALCODE=ZUWMADPANOFE&referral_id=0199a494-3ebf-7367-b409-9948de50a297)
+- [Reach 1000](https://www.hostinger.com/cart?product=reach%3A1000&period=12&referral_type=cart_link&REFERRALCODE=ZUWMADPANOFE&referral_id=0199a494-8bb9-726e-bb8d-9de9a72a3c21)
+- [Reach 2500](https://www.hostinger.com/cart?product=reach%3A2500&period=12&referral_type=cart_link&REFERRALCODE=ZUWMADPANOFE&referral_id=0199a494-c9c1-7191-b600-cafa2e9adafc)
+
+</details>
+
+## Contact
+
+Open an issue in `MADPANDA3D/FFMPEG-MCP`.
+
+<p align="center">
+  <img src="https://assets.zyrosite.com/cdn-cgi/image/format=auto,w=316,fit=crop,q=95/dJo56xnDoJCnbgxg/official-logo-mxBMZGQ8Owc8p2M2.jpeg" width="160" alt="MADPANDA3D logo" />
+  <br />
+  <strong>MADPANDA3D</strong>
+</p>
