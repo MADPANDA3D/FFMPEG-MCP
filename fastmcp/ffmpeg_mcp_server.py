@@ -10,7 +10,6 @@ from datetime import datetime, timezone
 from urllib.parse import parse_qs
 
 import aiofiles
-import jwt
 from mcp.server.fastmcp import FastMCP
 from rq import Queue
 from rq.job import Job
@@ -263,50 +262,6 @@ async def _send_jsonrpc_error(
     )
 
 
-def _split_scope_values(scope_claim) -> set[str]:
-    if isinstance(scope_claim, str):
-        return {part.strip() for part in scope_claim.split() if part.strip()}
-    if isinstance(scope_claim, list):
-        return {str(part).strip() for part in scope_claim if str(part).strip()}
-    return set()
-
-
-def _jwt_key_material() -> str:
-    alg = settings.jwt_alg.upper()
-    if alg.startswith("HS"):
-        key = settings.jwt_secret
-    else:
-        key = settings.jwt_public_key
-    key = (key or "").replace("\\n", "\n").strip()
-    if not key:
-        raise ValueError("JWT key material is not configured")
-    return key
-
-
-def _validate_bearer_token(token: str) -> dict:
-    if not token:
-        raise ValueError("missing bearer token")
-    key = _jwt_key_material()
-    decode_kwargs = {
-        "algorithms": [settings.jwt_alg.upper()],
-        "options": {"require": ["sub", "exp", "nbf"]},
-    }
-    if settings.jwt_issuer:
-        decode_kwargs["issuer"] = settings.jwt_issuer
-    if settings.jwt_audience:
-        decode_kwargs["audience"] = settings.jwt_audience
-    try:
-        claims = jwt.decode(token, key, **decode_kwargs)
-    except Exception as exc:
-        raise ValueError(f"invalid bearer token: {exc}") from exc
-
-    required_scope = settings.jwt_required_scope.strip()
-    scopes = _split_scope_values(claims.get("scope"))
-    if required_scope and required_scope not in scopes:
-        raise ValueError(f"token missing required scope: {required_scope}")
-    return claims
-
-
 def _register_rate_hit(kind: str, subject: str, limit: int) -> tuple[int | None, int]:
     if limit <= 0 or not subject:
         return None, 0
@@ -323,36 +278,6 @@ def _register_rate_hit(kind: str, subject: str, limit: int) -> tuple[int | None,
         return int(result[0]), retry_after
     except Exception:
         return None, retry_after
-
-
-def _count_active_jobs_for_user(owner_sub: str) -> int:
-    if not owner_sub:
-        return 0
-    try:
-        client = get_redis()
-    except Exception:
-        return 0
-
-    active = 0
-    cursor = 0
-    while True:
-        cursor, keys = client.scan(cursor=cursor, match="job:*", count=200)
-        if keys:
-            rows = client.mget(keys)
-            for raw in rows:
-                if not raw:
-                    continue
-                try:
-                    job = json.loads(raw)
-                except Exception:
-                    continue
-                if job.get("owner_sub") != owner_sub:
-                    continue
-                if job.get("status") in {"queued", "running"}:
-                    active += 1
-        if cursor == 0:
-            break
-    return active
 
 
 def _audit_request(
@@ -3468,7 +3393,7 @@ if __name__ == "__main__":
                     )
                     return
 
-            if path == "/mcp" and settings.auth_mode == "portal_only":
+            if path == "/mcp" and settings.auth_mode in {"portal_only", "grant_only"}:
                 if not settings.portal_grant_secret:
                     status_code = 500
                     bytes_out = await _send_jsonrpc_error(
@@ -3491,7 +3416,7 @@ if __name__ == "__main__":
                     )
                     return
 
-                required_headers = [settings.portal_grant_header, "Authorization"]
+                required_headers = [settings.portal_grant_header]
                 signup_data = {
                     "signup_url": settings.signup_url,
                     "required_headers": required_headers,
@@ -3510,91 +3435,6 @@ if __name__ == "__main__":
                         ),
                         request_id=jsonrpc_id,
                         data=signup_data,
-                    )
-                    _audit_request(
-                        request_id=request_id,
-                        sub=subject,
-                        key_id=key_id,
-                        client_ip=client_ip,
-                        tool=tool_name or method_name or path,
-                        status_code=status_code,
-                        duration_ms=int((time.perf_counter() - started_at) * 1000),
-                        bytes_in=bytes_in,
-                        bytes_out=bytes_out,
-                    )
-                    return
-
-                authorization = _extract_header(scope, "authorization") or ""
-                if not authorization.lower().startswith("bearer "):
-                    status_code = 401
-                    bytes_out = await _send_jsonrpc_error(
-                        send,
-                        status=status_code,
-                        code=-32001,
-                        message=(
-                            "Unauthorized: missing bearer token. "
-                            f"Sign up at {settings.signup_url} to access this MCP via the portal backend."
-                        ),
-                        request_id=jsonrpc_id,
-                        data=signup_data,
-                    )
-                    _audit_request(
-                        request_id=request_id,
-                        sub=subject,
-                        key_id=key_id,
-                        client_ip=client_ip,
-                        tool=tool_name or method_name or path,
-                        status_code=status_code,
-                        duration_ms=int((time.perf_counter() - started_at) * 1000),
-                        bytes_in=bytes_in,
-                        bytes_out=bytes_out,
-                    )
-                    return
-
-                token = authorization.split(" ", 1)[1].strip()
-                try:
-                    claims = _validate_bearer_token(token)
-                except ValueError as exc:
-                    status_code = 401
-                    bytes_out = await _send_jsonrpc_error(
-                        send,
-                        status=status_code,
-                        code=-32001,
-                        message=(
-                            f"Unauthorized: {exc}. "
-                            f"Sign up at {settings.signup_url} to access this MCP via the portal backend."
-                        ),
-                        request_id=jsonrpc_id,
-                        data=signup_data,
-                    )
-                    _audit_request(
-                        request_id=request_id,
-                        sub=subject,
-                        key_id=key_id,
-                        client_ip=client_ip,
-                        tool=tool_name or method_name or path,
-                        status_code=status_code,
-                        duration_ms=int((time.perf_counter() - started_at) * 1000),
-                        bytes_in=bytes_in,
-                        bytes_out=bytes_out,
-                    )
-                    return
-
-                subject = str(claims.get("sub"))
-                key_claim = claims.get("key_id") or claims.get("kid")
-                key_id = str(key_claim) if key_claim is not None else None
-
-                user_hits, user_retry_after = _register_rate_hit("user", subject, settings.rate_limit_user_rpm)
-                if user_hits is not None and settings.rate_limit_user_rpm > 0 and user_hits > settings.rate_limit_user_rpm:
-                    status_code = 429
-                    bytes_out = await _send_jsonrpc_error(
-                        send,
-                        status=status_code,
-                        code=-32002,
-                        message="Rate limit exceeded for user",
-                        request_id=jsonrpc_id,
-                        data={"retry_after": user_retry_after, "dimension": "user"},
-                        retry_after=user_retry_after,
                     )
                     _audit_request(
                         request_id=request_id,
@@ -3633,43 +3473,6 @@ if __name__ == "__main__":
                         bytes_out=bytes_out,
                     )
                     return
-
-                if (
-                    method_name == "tools/call"
-                    and tool_name
-                    and tool_name not in SYNC_TOOL_NAMES
-                    and settings.max_active_jobs_per_user > 0
-                ):
-                    active_jobs = _count_active_jobs_for_user(subject)
-                    if active_jobs >= settings.max_active_jobs_per_user:
-                        retry_after = max(1, settings.rate_limit_retry_after_seconds)
-                        status_code = 429
-                        bytes_out = await _send_jsonrpc_error(
-                            send,
-                            status=status_code,
-                            code=-32003,
-                            message="Too many active jobs for user",
-                            request_id=jsonrpc_id,
-                            data={
-                                "retry_after": retry_after,
-                                "active_jobs": active_jobs,
-                                "max_active_jobs": settings.max_active_jobs_per_user,
-                            },
-                            retry_after=retry_after,
-                        )
-                        _audit_request(
-                            request_id=request_id,
-                            sub=subject,
-                            key_id=key_id,
-                            client_ip=client_ip,
-                            tool=tool_name or method_name or path,
-                            status_code=status_code,
-                            duration_ms=int((time.perf_counter() - started_at) * 1000),
-                            bytes_in=bytes_in,
-                            bytes_out=bytes_out,
-                        )
-                        return
-
             context_token = REQUEST_CONTEXT.set(
                 {
                     "request_id": request_id,

@@ -102,16 +102,15 @@ Single wrapper mode:
 - Tool exposed: `FFMPEG_MCP`
 - Call with `{ "tool": "<tool_name>", "arguments": { ... } }`
 
-## Portal-only auth (production)
+## Grant-token auth (production)
 
-This deployment now supports portal-mediated access mode:
-- `MCP_AUTH_MODE=portal_only`
+This deployment now supports simple grant-token mode:
+- `MCP_AUTH_MODE=grant_only`
 - Required headers on `/mcp` requests:
   - `Content-Type: application/json`
   - `Accept: application/json, text/event-stream` (or at least `application/json`)
   - `X-MADPANDA-PORTAL-GRANT: <server-side-secret>`
-  - `Authorization: Bearer <portal-signed-user-jwt>`
-- Required JWT claims: `sub`, `exp`, `nbf`, and scope `mcp:ffmpeg`
+- No JWT is required in grant-token mode.
 
 Unauthorized requests return JSON-RPC errors with signup guidance:
 - `https://madpanda3d.com/lab/mad-mcps`
@@ -363,14 +362,12 @@ curl -i -X POST http://localhost:8087/mcp \
   -H "Content-Type: application/json" \
   -H "Accept: application/json, text/event-stream" \
   -H "X-MADPANDA-PORTAL-GRANT: <portal-grant-secret>" \
-  -H "Authorization: Bearer <portal-signed-jwt>" \
   -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}'
 
 curl -i -X POST http://localhost:8087/mcp \
   -H "Content-Type: application/json" \
   -H "Accept: application/json, text/event-stream" \
   -H "X-MADPANDA-PORTAL-GRANT: <portal-grant-secret>" \
-  -H "Authorization: Bearer <portal-signed-jwt>" \
   -d '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}'
 ```
 
