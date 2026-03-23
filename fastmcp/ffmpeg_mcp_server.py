@@ -1,4 +1,7 @@
 import asyncio
+import contextvars
+import hmac
+import json
 import logging
 import os
 import time
@@ -7,6 +10,7 @@ from datetime import datetime, timezone
 from urllib.parse import parse_qs
 
 import aiofiles
+import jwt
 from mcp.server.fastmcp import FastMCP
 from rq import Queue
 from rq.job import Job
@@ -109,6 +113,276 @@ mcp = FastMCP(
 )
 
 TOOL_MODE = settings.tool_mode if settings.tool_mode in {"individual", "router"} else "individual"
+
+REQUEST_CONTEXT: contextvars.ContextVar[dict] = contextvars.ContextVar("request_context", default={})
+
+SYNC_TOOL_NAMES = {
+    "brand_kit_delete",
+    "brand_kit_get",
+    "brand_kit_list",
+    "brand_kit_upsert",
+    "ffmpeg_capabilities",
+    "ffmpeg_describe_preset",
+    "ffmpeg_list_presets",
+    "job_logs",
+    "job_progress",
+    "job_status",
+    "media_export_to_discord",
+    "media_export_to_drive",
+    "media_get_download_url",
+    "media_ingest_from_drive",
+    "media_ingest_from_url",
+    "media_probe",
+    "metrics_snapshot",
+    "rubric_describe",
+    "rubric_list",
+    "template_describe",
+    "template_list",
+}
+
+
+def _current_request_context() -> dict:
+    ctx = REQUEST_CONTEXT.get()
+    if isinstance(ctx, dict):
+        return ctx
+    return {}
+
+
+def _extract_header(scope: dict, name: str) -> str | None:
+    target = name.lower().encode("utf-8")
+    for key, value in scope.get("headers", []):
+        if key.lower() == target:
+            try:
+                return value.decode("utf-8")
+            except Exception:
+                return None
+    return None
+
+
+def _extract_client_ip(scope: dict) -> str:
+    forwarded_for = _extract_header(scope, "x-forwarded-for")
+    if forwarded_for:
+        return forwarded_for.split(",", 1)[0].strip()
+    client = scope.get("client")
+    if isinstance(client, (tuple, list)) and client:
+        return str(client[0])
+    return "unknown"
+
+
+def _safe_parse_json(raw: bytes) -> dict | None:
+    if not raw:
+        return {}
+    try:
+        payload = json.loads(raw)
+    except Exception:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _extract_jsonrpc_metadata(payload: dict | None) -> tuple[str | None, str | None, str | int]:
+    request_id: str | int = "server-error"
+    method_name: str | None = None
+    tool_name: str | None = None
+    if isinstance(payload, dict):
+        raw_id = payload.get("id", "server-error")
+        if isinstance(raw_id, (str, int)):
+            request_id = raw_id
+        method_raw = payload.get("method")
+        if isinstance(method_raw, str):
+            method_name = method_raw
+            if method_raw == "tools/call":
+                params = payload.get("params")
+                if isinstance(params, dict):
+                    name = params.get("name")
+                    if isinstance(name, str):
+                        tool_name = name
+    return method_name, tool_name, request_id
+
+
+async def _read_request_body(receive) -> bytes:
+    chunks: list[bytes] = []
+    while True:
+        message = await receive()
+        if message.get("type") != "http.request":
+            continue
+        body = message.get("body") or b""
+        if body:
+            chunks.append(body)
+        if not message.get("more_body", False):
+            break
+    return b"".join(chunks)
+
+
+def _replay_receive(body: bytes):
+    sent = False
+
+    async def _inner():
+        nonlocal sent
+        if not sent:
+            sent = True
+            return {"type": "http.request", "body": body, "more_body": False}
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    return _inner
+
+
+async def _send_json(send, status: int, payload: dict, extra_headers: list[tuple[bytes, bytes]] | None = None) -> int:
+    body = json.dumps(payload, ensure_ascii=True, separators=(",", ":")).encode("utf-8")
+    headers = [
+        (b"content-type", b"application/json"),
+        (b"content-length", str(len(body)).encode("ascii")),
+    ]
+    if extra_headers:
+        headers.extend(extra_headers)
+    await send({"type": "http.response.start", "status": status, "headers": headers})
+    await send({"type": "http.response.body", "body": body})
+    return len(body)
+
+
+async def _send_jsonrpc_error(
+    send,
+    *,
+    status: int,
+    code: int,
+    message: str,
+    request_id: str | int,
+    data: dict | None = None,
+    retry_after: int | None = None,
+) -> int:
+    error_payload = {"code": code, "message": message}
+    if data is not None:
+        error_payload["data"] = data
+    extra_headers = []
+    if retry_after is not None and retry_after > 0:
+        extra_headers.append((b"retry-after", str(retry_after).encode("ascii")))
+    return await _send_json(
+        send,
+        status,
+        {"jsonrpc": "2.0", "id": request_id, "error": error_payload},
+        extra_headers=extra_headers,
+    )
+
+
+def _split_scope_values(scope_claim) -> set[str]:
+    if isinstance(scope_claim, str):
+        return {part.strip() for part in scope_claim.split() if part.strip()}
+    if isinstance(scope_claim, list):
+        return {str(part).strip() for part in scope_claim if str(part).strip()}
+    return set()
+
+
+def _jwt_key_material() -> str:
+    alg = settings.jwt_alg.upper()
+    if alg.startswith("HS"):
+        key = settings.jwt_secret
+    else:
+        key = settings.jwt_public_key
+    key = (key or "").replace("\\n", "\n").strip()
+    if not key:
+        raise ValueError("JWT key material is not configured")
+    return key
+
+
+def _validate_bearer_token(token: str) -> dict:
+    if not token:
+        raise ValueError("missing bearer token")
+    key = _jwt_key_material()
+    decode_kwargs = {
+        "algorithms": [settings.jwt_alg.upper()],
+        "options": {"require": ["sub", "exp", "nbf"]},
+    }
+    if settings.jwt_issuer:
+        decode_kwargs["issuer"] = settings.jwt_issuer
+    if settings.jwt_audience:
+        decode_kwargs["audience"] = settings.jwt_audience
+    try:
+        claims = jwt.decode(token, key, **decode_kwargs)
+    except Exception as exc:
+        raise ValueError(f"invalid bearer token: {exc}") from exc
+
+    required_scope = settings.jwt_required_scope.strip()
+    scopes = _split_scope_values(claims.get("scope"))
+    if required_scope and required_scope not in scopes:
+        raise ValueError(f"token missing required scope: {required_scope}")
+    return claims
+
+
+def _register_rate_hit(kind: str, subject: str, limit: int) -> tuple[int | None, int]:
+    if limit <= 0 or not subject:
+        return None, 0
+    now = int(time.time())
+    bucket = now // 60
+    retry_after = max(1, 60 - (now % 60))
+    key = f"mcp:ratelimit:{kind}:{subject}:{bucket}"
+    try:
+        client = get_redis()
+        pipe = client.pipeline()
+        pipe.incr(key, 1)
+        pipe.expire(key, retry_after + 5)
+        result = pipe.execute()
+        return int(result[0]), retry_after
+    except Exception:
+        return None, retry_after
+
+
+def _count_active_jobs_for_user(owner_sub: str) -> int:
+    if not owner_sub:
+        return 0
+    try:
+        client = get_redis()
+    except Exception:
+        return 0
+
+    active = 0
+    cursor = 0
+    while True:
+        cursor, keys = client.scan(cursor=cursor, match="job:*", count=200)
+        if keys:
+            rows = client.mget(keys)
+            for raw in rows:
+                if not raw:
+                    continue
+                try:
+                    job = json.loads(raw)
+                except Exception:
+                    continue
+                if job.get("owner_sub") != owner_sub:
+                    continue
+                if job.get("status") in {"queued", "running"}:
+                    active += 1
+        if cursor == 0:
+            break
+    return active
+
+
+def _audit_request(
+    *,
+    request_id: str,
+    sub: str | None,
+    key_id: str | None,
+    client_ip: str,
+    tool: str | None,
+    status_code: int,
+    duration_ms: int,
+    bytes_in: int,
+    bytes_out: int,
+) -> None:
+    log_event(
+        "mcp_request",
+        {
+            "request_id": request_id,
+            "sub": sub,
+            "key_id": key_id,
+            "client_ip": client_ip,
+            "tool": tool,
+            "status": "ok" if status_code < 400 else "error",
+            "http_status": status_code,
+            "duration_ms": duration_ms,
+            "bytes_in": bytes_in,
+            "bytes_out": bytes_out,
+        },
+    )
+
 
 _cleanup_started = False
 
@@ -411,6 +685,9 @@ def _record_cached_job(
 ) -> str:
     job_id = uuid.uuid4().hex
     now = utc_now_iso()
+    context = _current_request_context()
+    owner_sub = context.get("sub") if context.get("sub") else None
+    owner_key_id = context.get("key_id") if context.get("key_id") else None
     job = {
         "job_id": job_id,
         "type": job_type,
@@ -422,6 +699,8 @@ def _record_cached_job(
         "logs_short": "cache hit",
         "cache_hit": True,
         "cache_key": cache_key,
+        "owner_sub": owner_sub,
+        "owner_key_id": owner_key_id,
         "created_at": now,
         "updated_at": now,
         "started_at": now,
@@ -449,6 +728,9 @@ def _enqueue_job(
     queue = get_queue(priority=priority)
     job_id = uuid.uuid4().hex
     now = utc_now_iso()
+    context = _current_request_context()
+    owner_sub = context.get("sub") if context.get("sub") else None
+    owner_key_id = context.get("key_id") if context.get("key_id") else None
     job = {
         "job_id": job_id,
         "type": job_type,
@@ -460,6 +742,8 @@ def _enqueue_job(
         "logs_short": None,
         "cache_hit": False,
         "cache_key": cache_key,
+        "owner_sub": owner_sub,
+        "owner_key_id": owner_key_id,
         "created_at": now,
         "updated_at": now,
     }
@@ -3081,15 +3365,347 @@ if __name__ == "__main__":
             return await app(scope, receive, send)
 
         async def host_override(scope, receive, send):
-            if scope.get("type") == "http":
-                headers = []
-                for key, value in scope.get("headers", []):
-                    if key.lower() == b"host":
-                        continue
-                    headers.append((key, value))
-                headers.append((b"host", b"localhost"))
-                scope = {**scope, "headers": headers}
-            await router(scope, receive, send)
+            if scope.get("type") != "http":
+                return await router(scope, receive, send)
+
+            headers = []
+            for key, value in scope.get("headers", []):
+                if key.lower() == b"host":
+                    continue
+                headers.append((key, value))
+            headers.append((b"host", b"localhost"))
+            scope = {**scope, "headers": headers}
+
+            path = scope.get("path", "")
+            method = str(scope.get("method") or "").upper()
+            request_id = _extract_header(scope, "x-request-id") or uuid.uuid4().hex
+            client_ip = _extract_client_ip(scope)
+            subject: str | None = None
+            key_id: str | None = None
+            method_name: str | None = None
+            tool_name: str | None = None
+            jsonrpc_id: str | int = "server-error"
+            status_code = 500
+            bytes_out = 0
+            bytes_in = 0
+            payload: dict | None = None
+            body = b""
+            body_consumed = False
+            started_at = time.perf_counter()
+
+            if path == "/mcp" and method in {"POST", "PUT", "PATCH"}:
+                body = await _read_request_body(receive)
+                body_consumed = True
+                bytes_in = len(body)
+                payload = _safe_parse_json(body)
+                if payload is None:
+                    status_code = 400
+                    bytes_out = await _send_jsonrpc_error(
+                        send,
+                        status=status_code,
+                        code=-32600,
+                        message="Bad Request: body must be valid JSON-RPC object",
+                        request_id=jsonrpc_id,
+                    )
+                    _audit_request(
+                        request_id=request_id,
+                        sub=subject,
+                        key_id=key_id,
+                        client_ip=client_ip,
+                        tool=tool_name or method_name or path,
+                        status_code=status_code,
+                        duration_ms=int((time.perf_counter() - started_at) * 1000),
+                        bytes_in=bytes_in,
+                        bytes_out=bytes_out,
+                    )
+                    return
+                method_name, tool_name, jsonrpc_id = _extract_jsonrpc_metadata(payload)
+
+            if path == "/mcp" and method == "POST":
+                content_type = (_extract_header(scope, "content-type") or "").lower()
+                if "application/json" not in content_type:
+                    status_code = 400
+                    bytes_out = await _send_jsonrpc_error(
+                        send,
+                        status=status_code,
+                        code=-32600,
+                        message="Bad Request: Content-Type must include application/json",
+                        request_id=jsonrpc_id,
+                    )
+                    _audit_request(
+                        request_id=request_id,
+                        sub=subject,
+                        key_id=key_id,
+                        client_ip=client_ip,
+                        tool=tool_name or method_name or path,
+                        status_code=status_code,
+                        duration_ms=int((time.perf_counter() - started_at) * 1000),
+                        bytes_in=bytes_in,
+                        bytes_out=bytes_out,
+                    )
+                    return
+
+                accept = (_extract_header(scope, "accept") or "").lower()
+                if "application/json" not in accept:
+                    status_code = 406
+                    bytes_out = await _send_jsonrpc_error(
+                        send,
+                        status=status_code,
+                        code=-32600,
+                        message="Not Acceptable: Client must accept application/json",
+                        request_id=jsonrpc_id,
+                    )
+                    _audit_request(
+                        request_id=request_id,
+                        sub=subject,
+                        key_id=key_id,
+                        client_ip=client_ip,
+                        tool=tool_name or method_name or path,
+                        status_code=status_code,
+                        duration_ms=int((time.perf_counter() - started_at) * 1000),
+                        bytes_in=bytes_in,
+                        bytes_out=bytes_out,
+                    )
+                    return
+
+            if path == "/mcp" and settings.auth_mode == "portal_only":
+                if not settings.portal_grant_secret:
+                    status_code = 500
+                    bytes_out = await _send_jsonrpc_error(
+                        send,
+                        status=status_code,
+                        code=-32001,
+                        message="Server auth misconfiguration: portal grant secret is missing",
+                        request_id=jsonrpc_id,
+                    )
+                    _audit_request(
+                        request_id=request_id,
+                        sub=subject,
+                        key_id=key_id,
+                        client_ip=client_ip,
+                        tool=tool_name or method_name or path,
+                        status_code=status_code,
+                        duration_ms=int((time.perf_counter() - started_at) * 1000),
+                        bytes_in=bytes_in,
+                        bytes_out=bytes_out,
+                    )
+                    return
+
+                required_headers = [settings.portal_grant_header, "Authorization"]
+                signup_data = {
+                    "signup_url": settings.signup_url,
+                    "required_headers": required_headers,
+                }
+
+                provided_grant = _extract_header(scope, settings.portal_grant_header) or ""
+                if not hmac.compare_digest(provided_grant, settings.portal_grant_secret):
+                    status_code = 401
+                    bytes_out = await _send_jsonrpc_error(
+                        send,
+                        status=status_code,
+                        code=-32001,
+                        message=(
+                            "Unauthorized: missing/invalid portal grant. "
+                            f"Sign up at {settings.signup_url} to access this MCP via the portal backend."
+                        ),
+                        request_id=jsonrpc_id,
+                        data=signup_data,
+                    )
+                    _audit_request(
+                        request_id=request_id,
+                        sub=subject,
+                        key_id=key_id,
+                        client_ip=client_ip,
+                        tool=tool_name or method_name or path,
+                        status_code=status_code,
+                        duration_ms=int((time.perf_counter() - started_at) * 1000),
+                        bytes_in=bytes_in,
+                        bytes_out=bytes_out,
+                    )
+                    return
+
+                authorization = _extract_header(scope, "authorization") or ""
+                if not authorization.lower().startswith("bearer "):
+                    status_code = 401
+                    bytes_out = await _send_jsonrpc_error(
+                        send,
+                        status=status_code,
+                        code=-32001,
+                        message=(
+                            "Unauthorized: missing bearer token. "
+                            f"Sign up at {settings.signup_url} to access this MCP via the portal backend."
+                        ),
+                        request_id=jsonrpc_id,
+                        data=signup_data,
+                    )
+                    _audit_request(
+                        request_id=request_id,
+                        sub=subject,
+                        key_id=key_id,
+                        client_ip=client_ip,
+                        tool=tool_name or method_name or path,
+                        status_code=status_code,
+                        duration_ms=int((time.perf_counter() - started_at) * 1000),
+                        bytes_in=bytes_in,
+                        bytes_out=bytes_out,
+                    )
+                    return
+
+                token = authorization.split(" ", 1)[1].strip()
+                try:
+                    claims = _validate_bearer_token(token)
+                except ValueError as exc:
+                    status_code = 401
+                    bytes_out = await _send_jsonrpc_error(
+                        send,
+                        status=status_code,
+                        code=-32001,
+                        message=(
+                            f"Unauthorized: {exc}. "
+                            f"Sign up at {settings.signup_url} to access this MCP via the portal backend."
+                        ),
+                        request_id=jsonrpc_id,
+                        data=signup_data,
+                    )
+                    _audit_request(
+                        request_id=request_id,
+                        sub=subject,
+                        key_id=key_id,
+                        client_ip=client_ip,
+                        tool=tool_name or method_name or path,
+                        status_code=status_code,
+                        duration_ms=int((time.perf_counter() - started_at) * 1000),
+                        bytes_in=bytes_in,
+                        bytes_out=bytes_out,
+                    )
+                    return
+
+                subject = str(claims.get("sub"))
+                key_claim = claims.get("key_id") or claims.get("kid")
+                key_id = str(key_claim) if key_claim is not None else None
+
+                user_hits, user_retry_after = _register_rate_hit("user", subject, settings.rate_limit_user_rpm)
+                if user_hits is not None and settings.rate_limit_user_rpm > 0 and user_hits > settings.rate_limit_user_rpm:
+                    status_code = 429
+                    bytes_out = await _send_jsonrpc_error(
+                        send,
+                        status=status_code,
+                        code=-32002,
+                        message="Rate limit exceeded for user",
+                        request_id=jsonrpc_id,
+                        data={"retry_after": user_retry_after, "dimension": "user"},
+                        retry_after=user_retry_after,
+                    )
+                    _audit_request(
+                        request_id=request_id,
+                        sub=subject,
+                        key_id=key_id,
+                        client_ip=client_ip,
+                        tool=tool_name or method_name or path,
+                        status_code=status_code,
+                        duration_ms=int((time.perf_counter() - started_at) * 1000),
+                        bytes_in=bytes_in,
+                        bytes_out=bytes_out,
+                    )
+                    return
+
+                ip_hits, ip_retry_after = _register_rate_hit("ip", client_ip, settings.rate_limit_ip_rpm)
+                if ip_hits is not None and settings.rate_limit_ip_rpm > 0 and ip_hits > settings.rate_limit_ip_rpm:
+                    status_code = 429
+                    bytes_out = await _send_jsonrpc_error(
+                        send,
+                        status=status_code,
+                        code=-32002,
+                        message="Rate limit exceeded for IP",
+                        request_id=jsonrpc_id,
+                        data={"retry_after": ip_retry_after, "dimension": "ip"},
+                        retry_after=ip_retry_after,
+                    )
+                    _audit_request(
+                        request_id=request_id,
+                        sub=subject,
+                        key_id=key_id,
+                        client_ip=client_ip,
+                        tool=tool_name or method_name or path,
+                        status_code=status_code,
+                        duration_ms=int((time.perf_counter() - started_at) * 1000),
+                        bytes_in=bytes_in,
+                        bytes_out=bytes_out,
+                    )
+                    return
+
+                if (
+                    method_name == "tools/call"
+                    and tool_name
+                    and tool_name not in SYNC_TOOL_NAMES
+                    and settings.max_active_jobs_per_user > 0
+                ):
+                    active_jobs = _count_active_jobs_for_user(subject)
+                    if active_jobs >= settings.max_active_jobs_per_user:
+                        retry_after = max(1, settings.rate_limit_retry_after_seconds)
+                        status_code = 429
+                        bytes_out = await _send_jsonrpc_error(
+                            send,
+                            status=status_code,
+                            code=-32003,
+                            message="Too many active jobs for user",
+                            request_id=jsonrpc_id,
+                            data={
+                                "retry_after": retry_after,
+                                "active_jobs": active_jobs,
+                                "max_active_jobs": settings.max_active_jobs_per_user,
+                            },
+                            retry_after=retry_after,
+                        )
+                        _audit_request(
+                            request_id=request_id,
+                            sub=subject,
+                            key_id=key_id,
+                            client_ip=client_ip,
+                            tool=tool_name or method_name or path,
+                            status_code=status_code,
+                            duration_ms=int((time.perf_counter() - started_at) * 1000),
+                            bytes_in=bytes_in,
+                            bytes_out=bytes_out,
+                        )
+                        return
+
+            context_token = REQUEST_CONTEXT.set(
+                {
+                    "request_id": request_id,
+                    "sub": subject,
+                    "key_id": key_id,
+                    "client_ip": client_ip,
+                }
+            )
+            try:
+                if body_consumed:
+                    next_receive = _replay_receive(body)
+                else:
+                    next_receive = receive
+
+                async def send_wrapper(message):
+                    nonlocal status_code, bytes_out
+                    if message.get("type") == "http.response.start":
+                        status_code = int(message.get("status", 500))
+                    elif message.get("type") == "http.response.body":
+                        bytes_out += len(message.get("body") or b"")
+                    await send(message)
+
+                await router(scope, next_receive, send_wrapper)
+            finally:
+                REQUEST_CONTEXT.reset(context_token)
+                _audit_request(
+                    request_id=request_id,
+                    sub=subject,
+                    key_id=key_id,
+                    client_ip=client_ip,
+                    tool=tool_name or method_name or path,
+                    status_code=status_code,
+                    duration_ms=int((time.perf_counter() - started_at) * 1000),
+                    bytes_in=bytes_in,
+                    bytes_out=bytes_out,
+                )
 
         return host_override
 

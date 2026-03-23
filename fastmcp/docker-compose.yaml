@@ -1,3 +1,5 @@
+name: ffmpeg-mcp
+
 services:
   ffmpeg-mcp:
     container_name: ffmpeg-mcp
@@ -7,14 +9,22 @@ services:
       - .env
     environment:
       MCP_HTTP_PORT: "8087"
+      REDIS_URL: "redis://ffmpeg-mcp-redis:6379/0"
     ports:
       - "8087:8087"
     volumes:
       - ./data:/data
     depends_on:
-      - redis
+      ffmpeg-mcp-redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; s=socket.create_connection(('127.0.0.1', 8087), 2); s.close()"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
     networks:
-      - npm_default
+      - mcp-network
 
   ffmpeg-mcp-worker:
     container_name: ffmpeg-mcp-worker
@@ -22,20 +32,38 @@ services:
     restart: unless-stopped
     env_file:
       - .env
+    environment:
+      REDIS_URL: "redis://ffmpeg-mcp-redis:6379/0"
     command: ["python", "worker.py"]
     volumes:
       - ./data:/data
     depends_on:
-      - redis
+      ffmpeg-mcp-redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os, redis; redis.Redis.from_url(os.getenv('REDIS_URL', 'redis://ffmpeg-mcp-redis:6379/0')).ping()"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
     networks:
-      - npm_default
+      - mcp-network
 
-  redis:
+  ffmpeg-mcp-redis:
+    container_name: ffmpeg-mcp-redis
     image: redis:7-alpine
     restart: unless-stopped
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
     networks:
-      - npm_default
+      - mcp-network
 
 networks:
-  npm_default:
+  mcp-network:
     external: true
+    name: mcp-network
