@@ -3303,6 +3303,21 @@ if __name__ == "__main__":
 
             path = scope.get("path", "")
             method = str(scope.get("method") or "").upper()
+            if path == "/health":
+                tool_count = len(TOOL_REGISTRY)
+                await _send_json(
+                    send,
+                    200,
+                    {
+                        "ok": True,
+                        "service": "ffmpeg-mcp",
+                        "version": getattr(settings, "mcp_server_version", "dev"),
+                        "tool_count": tool_count,
+                        "tools": {"total": tool_count},
+                    },
+                )
+                return
+
             request_id = _extract_header(scope, "x-request-id") or uuid.uuid4().hex
             client_ip = _extract_client_ip(scope)
             subject: str | None = None
