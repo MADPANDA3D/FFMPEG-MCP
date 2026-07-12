@@ -1,7 +1,7 @@
 FROM python:3.12-slim
 
 ARG BUILD_SHA=unknown
-ARG BUILD_VERSION=2026-07-12.2
+ARG BUILD_VERSION=2026-07-12.3
 
 LABEL org.opencontainers.image.title="MADPANDA3D FFmpeg MCP" \
       org.opencontainers.image.revision="${BUILD_SHA}" \

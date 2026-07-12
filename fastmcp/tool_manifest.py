@@ -19,7 +19,7 @@ from typing import Any, get_args, get_origin, get_type_hints
 
 SCHEMA_VERSION = "1.0.0"
 SERVICE_ID = "ffmpeg"
-CATALOG_VERSION = "2026-07-12.2"
+CATALOG_VERSION = "2026-07-12.3"
 DOCUMENTATION_URL = "https://github.com/MADPANDA3D/FFMPEG-MCP"
 
 

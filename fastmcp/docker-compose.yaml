@@ -8,7 +8,7 @@ services:
       context: .
       args:
         BUILD_SHA: ${BUILD_SHA:-unknown}
-        BUILD_VERSION: ${BUILD_VERSION:-2026-07-12.2}
+        BUILD_VERSION: ${BUILD_VERSION:-2026-07-12.3}
     restart: unless-stopped
     env_file:
       - .env
@@ -39,7 +39,7 @@ services:
       context: .
       args:
         BUILD_SHA: ${BUILD_SHA:-unknown}
-        BUILD_VERSION: ${BUILD_VERSION:-2026-07-12.2}
+        BUILD_VERSION: ${BUILD_VERSION:-2026-07-12.3}
     restart: unless-stopped
     env_file:
       - .env

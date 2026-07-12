@@ -277,6 +277,51 @@ async def _send_jsonrpc_error(
     )
 
 
+def build_portal_grant_preparse_wrapper(app):
+    """Reject unauthorized MCP requests before reading or parsing their bodies."""
+
+    async def _wrapped(scope, receive, send):
+        if (
+            scope.get("type") != "http"
+            or scope.get("path", "") != "/mcp"
+            or settings.auth_mode not in {"portal_only", "grant_only"}
+        ):
+            await app(scope, receive, send)
+            return
+
+        if not settings.portal_grant_secret:
+            await _send_jsonrpc_error(
+                send,
+                status=500,
+                code=-32001,
+                message="Server auth misconfiguration: portal grant secret is missing",
+                request_id="server-error",
+            )
+            return
+
+        provided_grant = _extract_header(scope, settings.portal_grant_header) or ""
+        if not hmac.compare_digest(provided_grant, settings.portal_grant_secret):
+            await _send_jsonrpc_error(
+                send,
+                status=401,
+                code=-32001,
+                message=(
+                    "Unauthorized: missing/invalid portal grant. "
+                    f"Sign up at {settings.signup_url} to access this MCP via the portal backend."
+                ),
+                request_id="server-error",
+                data={
+                    "signup_url": settings.signup_url,
+                    "required_headers": [settings.portal_grant_header],
+                },
+            )
+            return
+
+        await app(scope, receive, send)
+
+    return _wrapped
+
+
 def _register_rate_hit(kind: str, subject: str, limit: int) -> tuple[int | None, int]:
     if limit <= 0 or not subject:
         return None, 0
@@ -3220,7 +3265,7 @@ def _current_tool_manifest() -> dict[str, Any]:
     return build_tool_manifest(TOOL_REGISTRY)
 
 
-async def tool_check_configuration() -> dict[str, Any]:
+def _configuration_status() -> dict[str, Any]:
     required = {
         "portal_grant_configured": bool(settings.portal_grant_secret),
         "redis_configured": bool(settings.redis_url),
@@ -3248,6 +3293,47 @@ async def tool_check_configuration() -> dict[str, Any]:
         "optional": optional,
         "missing": missing,
     }
+
+
+def _health_payload() -> dict[str, Any]:
+    manifest = _current_tool_manifest()
+    counts = manifest["counts"]
+    tool_count = len(TOOL_REGISTRY)
+    configuration = _configuration_status()
+    return {
+        "ok": True,
+        "status": "healthy" if configuration["ok"] else "degraded",
+        "service": "ffmpeg-mcp",
+        "version": manifest["buildSha"],
+        "build_sha": manifest["buildSha"],
+        "catalog_version": manifest["catalogVersion"],
+        "descriptor_hash": manifest["descriptorHash"],
+        "tool_count": tool_count,
+        "raw_tool_count": counts["raw"],
+        "exposed_tool_count": tool_count,
+        "agent_ready_tool_count": counts["agentReady"],
+        "documented_tool_count": counts["raw"],
+        "tools": {
+            "total": tool_count,
+            "raw": counts["raw"],
+            "exposed": tool_count,
+            "agent_ready": counts["agentReady"],
+            "legacy": counts["legacy"],
+            "hidden": counts["hidden"],
+            "documented": counts["raw"],
+        },
+        "configuration_ready": configuration["ok"],
+        "configuration": {
+            "ready": configuration["ok"],
+            "required": configuration["required"],
+            "optional": configuration["optional"],
+            "missing": configuration["missing"],
+        },
+    }
+
+
+async def tool_check_configuration() -> dict[str, Any]:
+    return _configuration_status()
 
 
 async def tool_list_capabilities(
@@ -3473,18 +3559,7 @@ if __name__ == "__main__":
             path = scope.get("path", "")
             method = str(scope.get("method") or "").upper()
             if path == "/health":
-                tool_count = len(TOOL_REGISTRY)
-                await _send_json(
-                    send,
-                    200,
-                    {
-                        "ok": True,
-                        "service": "ffmpeg-mcp",
-                        "version": getattr(settings, "mcp_server_version", "dev"),
-                        "tool_count": tool_count,
-                        "tools": {"total": tool_count},
-                    },
-                )
+                await _send_json(send, 200, _health_payload())
                 return
 
             request_id = _extract_header(scope, "x-request-id") or uuid.uuid4().hex
@@ -3694,7 +3769,7 @@ if __name__ == "__main__":
                     bytes_out=bytes_out,
                 )
 
-        return host_override
+        return build_portal_grant_preparse_wrapper(host_override)
 
     _start_cleanup_thread()
 
