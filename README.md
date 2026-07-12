@@ -32,7 +32,7 @@ FFMPEG MCP is a FastMCP service that runs FFmpeg jobs asynchronously with strict
 cd fastmcp
 cp .env.example .env
 
-docker-compose -f fastmcp/docker-compose.yaml up -d --build
+BUILD_SHA="$(git rev-parse HEAD)" docker-compose -f fastmcp/docker-compose.yaml up -d --build
 ```
 
 ## Features
@@ -82,17 +82,23 @@ http://ffmpeg-mcp:8087/mcp
 External:
 
 ```
-http://<vps-ip>:8087/mcp
+https://ffmpeg-mcp.madpanda3d.com/mcp
 ```
 
 ## Deployment (Nginx Proxy Manager)
 
-- Attach the container to `npm_default` (already in compose).
+- Attach Nginx Proxy Manager and the service to `mcp-network` (already in
+  Compose). No host port is published.
 - Forward Hostname/IP: `ffmpeg-mcp`
 - Forward Port: `8087`
 - Websockets: ON
 - HTTP/2: OFF
 - Allow `/download/` paths (signed URL delivery).
+
+The API and worker run as non-root UIDs with read-only root filesystems. Only
+the existing `./data:/data` media store is writable; temporary files use
+bounded tmpfs mounts. Linux capabilities are dropped, no-new-privileges is
+enabled, and API/worker/Redis CPU, memory, and PID limits are enforced.
 
 ## Tool Modes
 
