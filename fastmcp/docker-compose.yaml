@@ -3,13 +3,19 @@ name: ffmpeg-mcp
 services:
   ffmpeg-mcp:
     container_name: ffmpeg-mcp
-    build: .
+    image: ffmpeg-mcp-ffmpeg-mcp:${BUILD_SHA:-latest}
+    build:
+      context: .
+      args:
+        BUILD_SHA: ${BUILD_SHA:-unknown}
+        BUILD_VERSION: ${BUILD_VERSION:-2026-07-12.2}
     restart: unless-stopped
     env_file:
       - .env
     environment:
       MCP_HTTP_PORT: "8087"
       REDIS_URL: "redis://ffmpeg-mcp-redis:6379/0"
+      BUILD_SHA: ${BUILD_SHA:-unknown}
     ports:
       - "8087:8087"
     volumes:
@@ -28,12 +34,18 @@ services:
 
   ffmpeg-mcp-worker:
     container_name: ffmpeg-mcp-worker
-    build: .
+    image: ffmpeg-mcp-ffmpeg-mcp-worker:${BUILD_SHA:-latest}
+    build:
+      context: .
+      args:
+        BUILD_SHA: ${BUILD_SHA:-unknown}
+        BUILD_VERSION: ${BUILD_VERSION:-2026-07-12.2}
     restart: unless-stopped
     env_file:
       - .env
     environment:
       REDIS_URL: "redis://ffmpeg-mcp-redis:6379/0"
+      BUILD_SHA: ${BUILD_SHA:-unknown}
     command: ["python", "worker.py"]
     volumes:
       - ./data:/data
