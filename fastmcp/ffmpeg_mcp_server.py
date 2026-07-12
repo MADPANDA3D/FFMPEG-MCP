@@ -4,13 +4,17 @@ import hmac
 import json
 import logging
 import os
+import shutil
 import time
 import uuid
+from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
+from typing import Any
 from urllib.parse import parse_qs
 
 import aiofiles
 from mcp.server.fastmcp import FastMCP
+from mcp.types import ToolAnnotations
 from rq import Queue
 from rq.job import Job
 import uvicorn
@@ -79,6 +83,12 @@ from presets import describe_preset, get_preset, list_presets
 from rubrics import describe_rubric, get_rubric, list_rubrics, qa_from_report
 from templates import describe_template, list_templates
 from task_queue import get_queue
+from tool_manifest import (
+    DOCUMENTATION_URL as MANIFEST_DOCUMENTATION_URL,
+    build_tool_manifest,
+    resolve_tool_descriptor,
+    search_tool_manifest,
+)
 from redis_store import (
     build_cache_key,
     delete_cached_result,
@@ -123,6 +133,9 @@ SYNC_TOOL_NAMES = {
     "ffmpeg_capabilities",
     "ffmpeg_describe_preset",
     "ffmpeg_list_presets",
+    "find_tools",
+    "get_endpoint_coverage",
+    "get_tool_usage",
     "job_logs",
     "job_progress",
     "job_status",
@@ -133,6 +146,8 @@ SYNC_TOOL_NAMES = {
     "media_ingest_from_url",
     "media_probe",
     "metrics_snapshot",
+    "check_configuration",
+    "list_capabilities",
     "rubric_describe",
     "rubric_list",
     "template_describe",
@@ -1174,8 +1189,11 @@ async def tool_video_analyze(
         report = cached_payload.get("report")
         output_ids = cached_payload.get("output_asset_ids") or [asset_id]
         extra = {"report": report}
-        if cached_payload.get("qa") or (isinstance(report, dict) and report.get("qa")):
-            extra["qa"] = cached_payload.get("qa") or report.get("qa")
+        qa = cached_payload.get("qa")
+        if not qa and isinstance(report, dict):
+            qa = report.get("qa")
+        if qa:
+            extra["qa"] = qa
         job_id = _record_cached_job(
             "video_analyze",
             asset_id,
@@ -2739,8 +2757,11 @@ async def tool_render_iterate(
         result = cached_payload.get("result")
         output_ids = cached_payload.get("output_asset_ids") or []
         extra = {"result": result}
-        if cached_payload.get("qa") or (isinstance(result, dict) and result.get("qa")):
-            extra["qa"] = cached_payload.get("qa") or result.get("qa")
+        qa = cached_payload.get("qa")
+        if not qa and isinstance(result, dict):
+            qa = result.get("qa")
+        if qa:
+            extra["qa"] = qa
         job_id = _record_cached_job(
             "render_iterate",
             primary_asset_id,
@@ -3195,7 +3216,126 @@ async def tool_export_to_discord(
     return {"message_id": message_id}
 
 
-TOOL_REGISTRY = {
+def _current_tool_manifest() -> dict[str, Any]:
+    return build_tool_manifest(TOOL_REGISTRY)
+
+
+async def tool_check_configuration() -> dict[str, Any]:
+    required = {
+        "portal_grant_configured": bool(settings.portal_grant_secret),
+        "redis_configured": bool(settings.redis_url),
+        "storage_configured": bool(
+            settings.storage_local_dir
+            if settings.storage_backend == "local"
+            else settings.s3_bucket and settings.s3_access_key and settings.s3_secret_key
+        ),
+        "download_signing_configured": bool(
+            settings.public_base_url and settings.download_signing_secret
+        ),
+        "ffmpeg_available": shutil.which(settings.ffmpeg_bin) is not None,
+        "ffprobe_available": shutil.which(settings.ffprobe_bin) is not None,
+    }
+    optional = {
+        "google_drive_export_configured": bool(settings.google_drive_credentials_path),
+        "discord_export_configured": bool(settings.discord_bot_token),
+        "s3_storage_active": settings.storage_backend == "s3",
+    }
+    missing = [name for name, configured in required.items() if not configured]
+    return {
+        "ok": not missing,
+        "serviceId": "ffmpeg",
+        "required": required,
+        "optional": optional,
+        "missing": missing,
+    }
+
+
+async def tool_list_capabilities(
+    include_descriptors: bool = False,
+) -> dict[str, Any]:
+    manifest = _current_tool_manifest()
+    result = {
+        "schemaVersion": manifest["schemaVersion"],
+        "serviceId": manifest["serviceId"],
+        "catalogVersion": manifest["catalogVersion"],
+        "buildSha": manifest["buildSha"],
+        "descriptorHash": manifest["descriptorHash"],
+        "counts": manifest["counts"],
+        "tools": manifest["tools"] if include_descriptors else [],
+    }
+    return result
+
+
+async def tool_get_endpoint_coverage(
+    category: str | None = None,
+    tool_name: str | None = None,
+) -> dict[str, Any]:
+    manifest = _current_tool_manifest()
+    descriptors = manifest["tools"]
+    if category:
+        descriptors = [item for item in descriptors if item["category"] == category]
+    if tool_name:
+        selected = resolve_tool_descriptor(manifest, tool_name)
+        descriptors = [
+            item
+            for item in descriptors
+            if item["nativeToolName"] == selected["nativeToolName"]
+        ]
+    entries = [
+        {
+            "capability": descriptor["category"],
+            "nativeToolName": descriptor["nativeToolName"],
+            "title": descriptor["title"],
+            "tier": descriptor["tier"],
+            "status": "covered",
+            "providerInterface": "ffmpeg-cli",
+            "documentationUrl": descriptor["documentationUrl"],
+        }
+        for descriptor in descriptors
+    ]
+    return {
+        "serviceId": "ffmpeg",
+        "providerKind": "local-cli",
+        "source": "https://ffmpeg.org/documentation.html",
+        "catalogDocumentation": MANIFEST_DOCUMENTATION_URL,
+        "entries": entries,
+    }
+
+
+async def tool_get_tool_usage(tool_name: str) -> dict[str, Any]:
+    manifest = _current_tool_manifest()
+    return {"tool": resolve_tool_descriptor(manifest, tool_name)}
+
+
+async def tool_find_tools(
+    query: str,
+    category: str | None = None,
+    risk: str | None = None,
+    tier: str | None = "agent_ready",
+    limit: int = 8,
+) -> dict[str, Any]:
+    manifest = _current_tool_manifest()
+    results = search_tool_manifest(
+        manifest,
+        query,
+        category=category,
+        risk=risk,
+        tier=tier,
+        limit=limit,
+    )
+    return {
+        "query": query,
+        "count": len(results),
+        "results": results,
+    }
+
+
+TOOL_REGISTRY: dict[str, Callable[..., Awaitable[dict]]] = {
+    "check_configuration": tool_check_configuration,
+    "list_capabilities": tool_list_capabilities,
+    "get_endpoint_coverage": tool_get_endpoint_coverage,
+    "get_tool_usage": tool_get_tool_usage,
+    "find_tools": tool_find_tools,
     "media_ingest_from_url": tool_ingest_from_url,
     "media_ingest_from_drive": tool_ingest_from_drive,
     "media_probe": tool_probe,
@@ -3265,10 +3405,39 @@ async def tool_router(tool: str, arguments: dict | None = None) -> dict:
 
 def register_tools() -> None:
     if TOOL_MODE == "router":
-        mcp.tool(name="FFMPEG_MCP")(tool_router)
+        mcp.tool(
+            name="FFMPEG_MCP",
+            title="FFmpeg MCP Tool Router",
+            description=(
+                "Legacy compatibility router for invoking one named FFmpeg MCP tool. "
+                "Prefer individual tools or use list_capabilities and find_tools for discovery."
+            ),
+            annotations=ToolAnnotations(
+                readOnlyHint=False,
+                destructiveHint=True,
+                openWorldHint=True,
+                idempotentHint=False,
+            ),
+        )(tool_router)
         return
+    manifest_by_name = {
+        descriptor["nativeToolName"]: descriptor
+        for descriptor in _current_tool_manifest()["tools"]
+    }
     for name, func in TOOL_REGISTRY.items():
-        mcp.tool(name=name)(func)
+        descriptor = manifest_by_name[name]
+        mcp.tool(
+            name=name,
+            title=descriptor["title"],
+            description=descriptor["description"],
+            annotations=ToolAnnotations(**descriptor["annotations"]),
+            meta={
+                "com.madpanda/catalogVersion": descriptor["catalogVersion"],
+                "com.madpanda/descriptorHash": descriptor["descriptorHash"],
+                "com.madpanda/tier": descriptor["tier"],
+            },
+            structured_output=descriptor["category"] == "navigation",
+        )(func)
 
 
 if __name__ == "__main__":

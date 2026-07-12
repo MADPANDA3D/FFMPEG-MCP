@@ -44,3 +44,11 @@
 - Verified the ffmpeg MCP ticket history path already matches the meta-root standard: `/home/services/ffmpeg-mcp/tickets`.
 - Preserved `tickets/in-progress`, `tickets/completed`, `tickets/failed`, and `tickets/blocked` with `.gitkeep` files for support-agent automation.
 - No stale ticket-path references were found in local docs/session files.
+
+### 2026-07-12 — Agent-first ToolManifest baseline
+- The provider-owned catalog contract is `fastmcp/tool_manifest.py`, shared schema `1.0.0`, service ID `ffmpeg`, and catalog version `2026-07-12.1`.
+- The native individual-mode registry contains 55 tools: the existing 50 plus `check_configuration`, `list_capabilities`, `get_endpoint_coverage`, `get_tool_usage`, and `find_tools`.
+- Portal catalog ingestion should call `list_capabilities` with `include_descriptors: true`; the complete ordered manifest is returned at the `structuredContent` top level.
+- Descriptor hashes are deterministic over canonical descriptors and intentionally exclude the runtime `buildSha`; neither hashes nor navigation responses contain credential values.
+- `brand_kit_delete` is classified destructive and declares the exact Portal confirmation phrase `DELETE BRAND KIT`.
+- The first implementation is committed on `feat/tool-manifest` and was not deployed during this slice.

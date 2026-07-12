@@ -45,6 +45,8 @@ docker-compose -f fastmcp/docker-compose.yaml up -d --build
 - Signed download URLs (`/download/{asset_id}`)
 - Optional exports to Drive and Discord
 - `ffmpeg_capabilities` self-description endpoint
+- Versioned, provider-owned ToolManifest with deterministic descriptor hashes
+- Agent navigation for configuration, capability, coverage, usage, and tool search
 
 ## Tech Stack
 
@@ -178,6 +180,11 @@ Batch + workflow:
 - `workflow_run`
 
 Meta:
+- `check_configuration`
+- `list_capabilities`
+- `get_endpoint_coverage`
+- `get_tool_usage`
+- `find_tools`
 - `ffmpeg_list_presets`
 - `ffmpeg_describe_preset`
 - `ffmpeg_capabilities`
@@ -187,6 +194,36 @@ Meta:
 - `metrics_snapshot`
 
 </details>
+
+## Agent ToolManifest
+
+`list_capabilities` is the provider-owned catalog entrypoint. Its compact
+response includes `schemaVersion`, canonical `serviceId`, `catalogVersion`,
+safe `buildSha`, deterministic `descriptorHash`, raw/agent-ready/legacy/hidden
+counts, and an empty compact `tools` array. Pass `include_descriptors: true` to
+include every ordered descriptor.
+
+Each lossless descriptor includes the native name and aliases, title, full
+description, category, deprecation metadata, complete input/output schemas,
+read-only/destructive/open-world/idempotency annotations, confirmation rule,
+documentation URL, navigation role, catalog version, descriptor hash, and
+contract tier. Runtime credentials and configuration values are excluded from
+descriptor hashes and responses.
+
+Example through `tools/call`:
+
+```json
+{
+  "name": "list_capabilities",
+  "arguments": {
+    "include_descriptors": true
+  }
+}
+```
+
+Use `find_tools` for deterministic, punctuation-normalized, multi-token search.
+Use `get_tool_usage` after discovery to retrieve the complete descriptor for one
+native name or alias without executing provider work.
 
 ## Presets
 
