@@ -210,6 +210,11 @@ documentation URL, navigation role, catalog version, descriptor hash, and
 contract tier. Runtime credentials and configuration values are excluded from
 descriptor hashes and responses.
 
+Destructive confirmation phrases are supplied out-of-band to
+`portal.call_destructive_tool`. They are not native FFmpeg tool arguments. For
+example, `brand_kit_delete` accepts only `brand_kit_id`; its descriptor declares
+the exact Portal phrase `DELETE BRAND KIT` with a null `confirmation.parameter`.
+
 Example through `tools/call`:
 
 ```json

@@ -16,3 +16,9 @@
 - Added `check_configuration`, `list_capabilities`, `get_endpoint_coverage`, `get_tool_usage`, and `find_tools`; `list_capabilities(include_descriptors=true)` returns the lossless manifest in MCP `structuredContent`.
 - Preserved the existing grant-only middleware, legacy `ffmpeg_capabilities`, router mode, media behavior, credentials, and running containers.
 - Verification: 12/12 focused tests; Ruff clean; mypy clean for changed source; Python compile clean; Compose config valid; test image built; ephemeral HTTP smoke returned missing/invalid grant 401, valid grant 200, health/tools-list count 55, and structured manifest count 55.
+
+### 2026-07-12 confirmation contract correction
+
+- Bumped the FFmpeg catalog to `2026-07-12.2` and made destructive confirmation explicitly out-of-band.
+- `brand_kit_delete` still requires exact Portal phrase `DELETE BRAND KIT`; its manifest parameter is null because the native provider function consumes only `brand_kit_id`.
+- No runtime provider behavior or deployment changed.

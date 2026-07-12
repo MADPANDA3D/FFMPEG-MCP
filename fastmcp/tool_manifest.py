@@ -19,7 +19,7 @@ from typing import Any, get_args, get_origin, get_type_hints
 
 SCHEMA_VERSION = "1.0.0"
 SERVICE_ID = "ffmpeg"
-CATALOG_VERSION = "2026-07-12.1"
+CATALOG_VERSION = "2026-07-12.2"
 DOCUMENTATION_URL = "https://github.com/MADPANDA3D/FFMPEG-MCP"
 
 
@@ -1196,10 +1196,13 @@ def _descriptor(name: str, function: Callable[..., Any]) -> dict[str, Any]:
         },
         "confirmation": {
             "required": confirmation_phrase is not None,
-            "parameter": "confirmation" if confirmation_phrase is not None else None,
+            # Agent Contract v2 carries exact phrases on its destructive executor.
+            # They are deliberately not added to native provider arguments.
+            "parameter": None,
             "exactPhrase": confirmation_phrase,
             "when": (
-                "Before permanently deleting the named brand-kit definition."
+                "Supply this exact phrase out-of-band to portal.call_destructive_tool "
+                "before provider execution; it is not a native FFmpeg tool argument."
                 if confirmation_phrase is not None
                 else None
             ),

@@ -161,8 +161,21 @@ class ToolManifestTests(unittest.TestCase):
             set(delete["confirmation"]),
             {"required", "parameter", "exactPhrase", "when"},
         )
-        self.assertEqual(delete["confirmation"]["parameter"], "confirmation")
+        self.assertIsNone(delete["confirmation"]["parameter"])
         self.assertEqual(delete["confirmation"]["exactPhrase"], "DELETE BRAND KIT")
+        self.assertIn(
+            "out-of-band to portal.call_destructive_tool",
+            delete["confirmation"]["when"],
+        )
+        self.assertEqual(
+            set(delete["inputSchema"]["properties"]),
+            {"brand_kit_id"},
+        )
+        self.assertNotIn(
+            "confirmation",
+            delete["inputSchema"]["properties"],
+            "Portal confirmation must not leak into native provider arguments",
+        )
         self.assertFalse(tools["brand_kit_get"]["confirmation"]["required"])
 
 
