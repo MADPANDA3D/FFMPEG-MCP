@@ -1,0 +1,40 @@
+name: Bug report
+description: Report a reproducible defect without private data or credentials.
+title: "[Bug]: "
+labels: [bug]
+body:
+  - type: checkboxes
+    attributes:
+      label: Safety check
+      options:
+        - label: I removed credentials, private media, private hostnames, and personal data.
+          required: true
+        - label: I tested the latest stable release.
+          required: true
+  - type: input
+    attributes:
+      label: Version or image digest
+      placeholder: v1.0.0 or sha256:...
+    validations:
+      required: true
+  - type: dropdown
+    attributes:
+      label: Deployment mode
+      options: [standalone, portal, local Python package]
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: Reproduction
+      description: Provide the smallest safe sequence that reproduces the issue.
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: Expected and actual behavior
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: Redacted logs
+      render: shell

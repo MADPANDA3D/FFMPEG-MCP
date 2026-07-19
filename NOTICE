@@ -1,0 +1,15 @@
+MADPANDA3D FFMPEG MCP
+Copyright (c) 2026 MADPANDA3D
+
+This repository's original source is licensed under the MIT License.
+
+The container installs FFmpeg from Debian. FFmpeg is a separate project distributed
+under its own applicable LGPL/GPL terms; those terms depend on the exact build and
+enabled components. See https://ffmpeg.org/legal.html and inspect the installed
+binary with `ffmpeg -L` for the terms that apply to a particular image.
+
+FFmpeg is a trademark of Fabrice Bellard, originator of the FFmpeg project. This
+project is not affiliated with or endorsed by the FFmpeg project.
+
+Other bundled or installed dependencies retain their respective copyrights and
+licenses. Distribution artifacts include dependency metadata for inspection.
