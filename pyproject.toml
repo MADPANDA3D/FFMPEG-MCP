@@ -1,0 +1,91 @@
+[build-system]
+requires = ["hatchling==1.31.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "mad-mcp-ffmpeg"
+version = "1.0.0"
+description = "A dual-mode MCP server for bounded, asynchronous FFmpeg media workflows"
+readme = "README.md"
+requires-python = ">=3.12,<3.14"
+license = "MIT"
+authors = [{ name = "MADPANDA3D" }]
+keywords = ["mcp", "ffmpeg", "media", "video", "audio", "ai-agents"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Multimedia :: Sound/Audio :: Conversion",
+  "Topic :: Multimedia :: Video :: Conversion",
+]
+dependencies = [
+  "aiofiles>=23.2.1,<26",
+  "boto3>=1.34.0,<2",
+  "filetype>=1.2.0,<2",
+  "google-api-python-client>=2.130.0,<3",
+  "google-auth>=2.34.0,<3",
+  "httpx>=0.27.0,<1",
+  "jsonschema>=4.26.0,<5",
+  "mcp==1.28.1",
+  "redis>=5.0.0,<7",
+  "rq>=1.15.1,<3",
+  "starlette>=0.37.0,<2",
+  "uvicorn>=0.30.0,<1",
+]
+
+[project.urls]
+Homepage = "https://github.com/MADPANDA3D/FFMPEG-MCP"
+Documentation = "https://github.com/MADPANDA3D/FFMPEG-MCP#readme"
+Issues = "https://github.com/MADPANDA3D/FFMPEG-MCP/issues"
+Security = "https://github.com/MADPANDA3D/FFMPEG-MCP/security/policy"
+Source = "https://github.com/MADPANDA3D/FFMPEG-MCP"
+
+[dependency-groups]
+dev = [
+  "bandit[toml]>=1.9.2,<2",
+  "build>=1.3.0,<2",
+  "isort>=8.0.1,<9",
+  "mypy>=2.3.0,<3",
+  "pip-audit>=2.9.0,<3",
+  "pytest>=9.1.1,<10",
+  "pytest-asyncio>=1.3.0,<2",
+  "ruff>=0.15.0,<1",
+  "twine>=6.2.0,<7",
+]
+
+[project.scripts]
+mad-mcp-ffmpeg = "madpanda_ffmpeg_mcp.server:main"
+mad-mcp-ffmpeg-worker = "madpanda_ffmpeg_mcp.worker:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/madpanda_ffmpeg_mcp"]
+
+[tool.pytest.ini_options]
+addopts = "-ra --strict-config --strict-markers"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.mypy]
+python_version = "3.12"
+packages = ["madpanda_ffmpeg_mcp"]
+warn_unused_configs = true
+check_untyped_defs = true
+no_implicit_optional = true
+ignore_missing_imports = true
+
+[tool.isort]
+profile = "black"
+line_length = 100
+
+[tool.bandit]
+exclude_dirs = ["tests"]
+skips = ["B104"]

@@ -1,0 +1,9 @@
+services:
+  ffmpeg-mcp:
+    environment:
+      GOOGLE_DRIVE_CREDENTIALS_PATH: /run/secrets/google-drive.json
+    volumes:
+      - type: bind
+        source: ${GOOGLE_DRIVE_CREDENTIALS_FILE:?Set GOOGLE_DRIVE_CREDENTIALS_FILE to an external credential JSON path}
+        target: /run/secrets/google-drive.json
+        read_only: true
