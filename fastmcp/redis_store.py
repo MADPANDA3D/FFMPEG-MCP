@@ -18,6 +18,7 @@ BRAND_KIT_SET = "brandkit:all"
 
 
 _redis_client: redis.Redis | None = None
+_rq_redis_client: redis.Redis | None = None
 
 
 def get_redis() -> redis.Redis:
@@ -25,6 +26,14 @@ def get_redis() -> redis.Redis:
     if _redis_client is None:
         _redis_client = redis.Redis.from_url(settings.redis_url, decode_responses=True)
     return _redis_client
+
+
+def get_rq_redis() -> redis.Redis:
+    """Return the binary-safe Redis connection required by RQ."""
+    global _rq_redis_client
+    if _rq_redis_client is None:
+        _rq_redis_client = redis.Redis.from_url(settings.redis_url, decode_responses=False)
+    return _rq_redis_client
 
 
 def _now_ts() -> int:

@@ -1,7 +1,7 @@
 from rq import Queue
 
 from config import settings
-from redis_store import get_redis
+from redis_store import get_rq_redis
 
 
 _queues: dict[str, Queue] = {}
@@ -22,6 +22,6 @@ def get_queue(priority: str | None = None) -> Queue:
     name = _queue_name_for_priority(priority)
     queue = _queues.get(name)
     if queue is None:
-        queue = Queue(name, connection=get_redis())
+        queue = Queue(name, connection=get_rq_redis())
         _queues[name] = queue
     return queue

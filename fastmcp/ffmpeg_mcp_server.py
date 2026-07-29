@@ -97,6 +97,7 @@ from redis_store import (
     get_cached_result,
     get_job,
     get_redis,
+    get_rq_redis,
     list_brand_kits,
     save_brand_kit,
     delete_brand_kit,
@@ -3103,7 +3104,7 @@ async def tool_job_logs(job_id: str) -> dict:
 async def tool_metrics_snapshot() -> dict:
     queue_depth: dict[str, int] = {}
     for name in settings.queue_names():
-        queue = Queue(name, connection=get_redis())
+        queue = Queue(name, connection=get_rq_redis())
         depth = queue.count
         if callable(depth):
             depth = depth()
