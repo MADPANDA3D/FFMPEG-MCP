@@ -164,6 +164,7 @@ The safe baseline lives in [.env.example](.env.example). Blank secret fields are
 | `MCP_ACCESS_TOKEN` | Standalone bearer credential | blank; required in standalone mode |
 | `MCP_PORTAL_GRANT_TOKEN` | Broker-to-server grant credential | blank; required in Portal mode |
 | `X-MADPANDA-PORTAL-SUBJECT` | Fixed trusted Portal request header carrying the stable tenant ID | broker-supplied in Portal mode |
+| `MCP_DISCORD_TOKEN_HEADER` | Protected broker header carrying the calling user's Discord BYOK token for one export request | `X-Discord-Bot-Token` |
 | `MCP_PRINCIPAL_HASH_SECRET` | Stable HMAC key for tenant namespaces | blank; required, migration-sensitive |
 | `MCP_ALLOWED_HOSTS` | Accepted HTTP Host values | local/container names only |
 | `MCP_ALLOWED_ORIGINS` | Browser origins allowed to call MCP | blank |
@@ -206,9 +207,9 @@ The safe baseline lives in [.env.example](.env.example). Blank secret fields are
 | `ASSET_DELETE_LEASE_SECONDS` / `ASSET_DELETE_RETRY_BASE_SECONDS` / `ASSET_DELETE_RETRY_MAX_SECONDS` | Delete claim lease and exponential retry bounds | `180` / `60` / `3600` |
 | `JOB_STORAGE_MAX_OUTPUT_COUNT` / `JOB_STORAGE_MAX_OUTPUT_BYTES` / `JOB_STORAGE_MAX_MATERIALIZE_BYTES` | Per-job output count, output bytes, and S3 input-materialization bytes | `25` / `2147483648` / `2147483648` |
 
-Optional Discord, Google Drive, and S3 credentials are deployment secrets owned by the operator. Leave their fields blank when those integrations are not used. Never put secrets in MCP arguments, issue reports, logs, or commits.
+Google Drive, S3, and standalone Discord credentials are deployment secrets owned by the operator. Portal-mode Discord export instead requires the calling user's request-scoped BYOK token from the trusted broker; it is never stored by FFMPEG MCP or forwarded into FastMCP. Leave optional fields blank when integrations are not used. Never put secrets in MCP arguments, issue reports, logs, or commits.
 
-Drive ingest and export and Discord export are disabled by default. Enabling them also requires exact file/folder/channel allowlists. Provider writes require native confirmation arguments: `EXPORT TO GOOGLE DRIVE` or `EXPORT TO DISCORD`; deleting a brand kit requires `DELETE BRAND KIT`.
+Drive ingest and export and Discord export are disabled by default. Drive and standalone Discord modes require exact file/folder/channel allowlists. Portal-mode Discord destinations are bounded by the caller's own bot permissions and still require an explicit numeric channel ID. Provider writes require native confirmation arguments: `EXPORT TO GOOGLE DRIVE` or `EXPORT TO DISCORD`; deleting a brand kit requires `DELETE BRAND KIT`.
 
 For Drive, keep the credential JSON outside the repository and mount it read-only with the supplied override:
 

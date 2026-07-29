@@ -13,9 +13,9 @@ The project does not claim to sandbox hostile codecs as strongly as a dedicated 
 | `standalone` | `Authorization: Bearer ...` | Direct client to a loopback or TLS-protected endpoint |
 | `portal` | Grant plus fixed `X-MADPANDA-PORTAL-SUBJECT` | Trusted private broker and stable tenant identity |
 
-Both are service authentication. Optional Drive, Discord, and S3 credentials are server-side deployment secrets; they are not accepted from individual MCP requests.
+Both are service authentication. Optional Drive, S3, and standalone Discord credentials are server-side deployment secrets. In Portal mode, Discord export is the exception: the trusted broker injects the authenticated caller's BYOK token into a dedicated protected header for that one request. FFMPEG MCP strips the header before FastMCP dispatch, keeps it only in request-local memory, and never falls back to a shared Discord token.
 
-Portal mode assumes the broker authenticates and authorizes its users, removes client-supplied protected headers, injects the trusted deployment grant and stable authenticated subject, and connects over a private network. The subject is HMAC-derived with `MCP_PRINCIPAL_HASH_SECRET` and scopes tenant assets, jobs, caches, and brand kits. Changing that secret or a subject mapping changes the namespace; migrate or intentionally discard old state before rotating it. The supplied Portal Compose file publishes no host port.
+Portal mode assumes the broker authenticates and authorizes its users, removes client-supplied protected headers, injects the trusted deployment grant and stable authenticated subject, and connects over a private network. For Discord export only, it may also inject the caller's encrypted-at-rest BYOK credential into the configured Discord token header. The subject is HMAC-derived with `MCP_PRINCIPAL_HASH_SECRET` and scopes tenant assets, jobs, caches, and brand kits. Changing that secret or a subject mapping changes the namespace; migrate or intentionally discard old state before rotating it. The supplied Portal Compose file publishes no host port.
 
 ## Primary abuse cases and controls
 
@@ -63,7 +63,7 @@ Brand-kit IDs are restricted to storage-safe values and cannot collide with the 
 
 ### Provider side effects
 
-Drive ingest/export and Discord export are opt-in and require exact destination allowlists. Drive and Discord writes require `EXPORT TO GOOGLE DRIVE` and `EXPORT TO DISCORD`; brand-kit deletion requires `DELETE BRAND KIT`. Provider credentials are mounted or injected only into the HTTP service. The worker receives Redis, storage, media, queue, and optional S3 settings only.
+Drive ingest/export and Discord export are opt-in. Drive and standalone Discord deployments require exact destination allowlists. Portal-mode Discord export uses the caller's request-scoped bot permissions instead of a global channel allowlist. Drive and Discord writes require `EXPORT TO GOOGLE DRIVE` and `EXPORT TO DISCORD`; brand-kit deletion requires `DELETE BRAND KIT`. Provider credentials exist only in the HTTP service request boundary. The worker receives Redis, storage, media, queue, and optional S3 settings only.
 
 ## Container boundary
 

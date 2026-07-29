@@ -18,10 +18,17 @@ _MAX_DISCORD_HTTP_TIMEOUT_SECONDS = 120
 _MAX_DISCORD_RESPONSE_BYTES = 5_000_000
 
 
-def _build_headers() -> dict[str, str]:
-    if not settings.discord_bot_token:
-        raise DiscordExportError("DISCORD_BOT_TOKEN is required")
-    return {"Authorization": f"Bot {settings.discord_bot_token}"}
+def _build_headers(
+    request_token: str | None = None,
+    *,
+    allow_environment_fallback: bool = True,
+) -> dict[str, str]:
+    token = str(request_token or "").strip()
+    if not token and allow_environment_fallback:
+        token = settings.discord_bot_token
+    if not token:
+        raise DiscordExportError("A request-scoped Discord BYOK credential is required")
+    return {"Authorization": f"Bot {token}"}
 
 
 def _configured_channel_ids() -> set[str]:
@@ -30,17 +37,18 @@ def _configured_channel_ids() -> set[str]:
     return {str(value).strip() for value in values if str(value).strip()}
 
 
-def _validate_destination(channel_id: str) -> str:
+def _validate_destination(channel_id: str, *, require_allowlisted_channel: bool = True) -> str:
     channel_id = str(channel_id or "").strip()
     if not re.fullmatch(r"[0-9]{1,32}", channel_id):
         raise DiscordExportError("Discord channel id is invalid")
-    allowed = _configured_channel_ids()
-    if not allowed:
-        raise DiscordExportError(
-            "Discord exports are disabled until an allowed channel is configured"
-        )
-    if channel_id not in allowed:
-        raise DiscordExportError("Discord channel is not allowlisted")
+    if require_allowlisted_channel:
+        allowed = _configured_channel_ids()
+        if not allowed:
+            raise DiscordExportError(
+                "Discord exports are disabled until an allowed channel is configured"
+            )
+        if channel_id not in allowed:
+            raise DiscordExportError("Discord channel is not allowlisted")
     return channel_id
 
 
@@ -124,12 +132,20 @@ async def send_file(
     filename: str,
     message: str | None,
     mime_type: str | None,
+    discord_bot_token: str | None = None,
+    allow_environment_fallback: bool = True,
+    require_allowlisted_channel: bool = True,
 ) -> str:
-    channel_id = _validate_destination(channel_id)
+    channel_id = _validate_destination(
+        channel_id, require_allowlisted_channel=require_allowlisted_channel
+    )
     filename = _validate_filename(filename)
     if message is not None and (not isinstance(message, str) or len(message) > 2000):
         raise DiscordExportError("Discord message is invalid")
-    headers = _build_headers()
+    headers = _build_headers(
+        discord_bot_token,
+        allow_environment_fallback=allow_environment_fallback,
+    )
     url = f"{DISCORD_API_ORIGIN}/channels/{channel_id}/messages"
     payload: dict[str, Any] = {}
     if message:
