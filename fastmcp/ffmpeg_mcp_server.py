@@ -174,6 +174,28 @@ def _extract_header(scope: dict, name: str) -> str | None:
     return None
 
 
+def _extract_request_scoped_discord_token(scope: dict) -> str:
+    target = settings.discord_token_header.lower().encode("utf-8")
+    values = [
+        value
+        for key, value in scope.get("headers", [])
+        if key.lower() == target
+    ]
+    if len(values) != 1:
+        return ""
+    try:
+        token = values[0].decode("utf-8")
+    except Exception:
+        return ""
+    if (
+        token != token.strip()
+        or not 20 <= len(token) <= 512
+        or any(ord(character) < 33 or ord(character) == 127 for character in token)
+    ):
+        return ""
+    return token
+
+
 def _extract_client_ip(scope: dict) -> str:
     forwarded_for = _extract_header(scope, "x-forwarded-for")
     if forwarded_for:
@@ -3246,12 +3268,14 @@ async def tool_export_to_discord(
 
     send_name = filename or asset.get("original_filename") or f"{asset_id}"
     try:
+        context = _current_request_context()
         message_id = await send_file(
             channel_id=channel_id,
             file_path=path,
             filename=send_name,
             message=message,
             mime_type=asset.get("mime_type"),
+            discord_bot_token=context.get("discord_bot_token"),
         )
     except DiscordExportError as exc:
         raise ValueError(str(exc))
@@ -3283,7 +3307,10 @@ def _configuration_status() -> dict[str, Any]:
     }
     optional = {
         "google_drive_export_configured": bool(settings.google_drive_credentials_path),
-        "discord_export_configured": bool(settings.discord_bot_token),
+        "discord_export_configured": bool(
+            settings.auth_mode in {"portal_only", "grant_only"}
+            or settings.discord_bot_token
+        ),
         "s3_storage_active": settings.storage_backend == "s3",
     }
     missing = [name for name, configured in required.items() if not configured]
@@ -3733,12 +3760,25 @@ if __name__ == "__main__":
                         bytes_out=bytes_out,
                     )
                     return
+            discord_bot_token = ""
+            if settings.auth_mode in {"portal_only", "grant_only"}:
+                discord_bot_token = _extract_request_scoped_discord_token(scope)
+            discord_header = settings.discord_token_header.lower().encode("utf-8")
+            scope = {
+                **scope,
+                "headers": [
+                    (key, value)
+                    for key, value in scope.get("headers", [])
+                    if key.lower() != discord_header
+                ],
+            }
             context_token = REQUEST_CONTEXT.set(
                 {
                     "request_id": request_id,
                     "sub": subject,
                     "key_id": key_id,
                     "client_ip": client_ip,
+                    "discord_bot_token": discord_bot_token,
                 }
             )
             try:

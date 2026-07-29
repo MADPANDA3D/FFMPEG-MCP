@@ -136,6 +136,11 @@ Ingest + storage:
 - `media_export_to_drive`
 - `media_export_to_discord`
 
+When FFMPEG-MCP runs behind MAD MCP Portal, Discord export uses the calling
+user's encrypted Discord BYOK credential through the request-scoped
+`X-Discord-Bot-Token` header. Portal/grant-only mode never falls back to a
+shared container bot token.
+
 Core video:
 - `ffmpeg_transcode`
 - `ffmpeg_thumbnail`

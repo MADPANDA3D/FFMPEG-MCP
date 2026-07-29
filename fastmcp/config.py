@@ -227,6 +227,9 @@ class Settings:
     log_structured: bool = _get_bool("MCP_LOG_STRUCTURED", False)
 
     discord_bot_token: str = _get_env("DISCORD_BOT_TOKEN", "")
+    discord_token_header: str = _get_env(
+        "MCP_DISCORD_TOKEN_HEADER", "x-discord-bot-token"
+    ).lower()
     discord_api_base: str = _get_env("DISCORD_API_BASE", "https://discord.com/api/v10")
     discord_max_upload_bytes: int = _get_int("DISCORD_MAX_UPLOAD_BYTES", 25_000_000)
 
