@@ -407,6 +407,7 @@ class Settings:
     log_structured: bool = _get_bool("MCP_LOG_STRUCTURED", False)
 
     discord_bot_token: str = _get_env("DISCORD_BOT_TOKEN", "")
+    discord_token_header: str = _get_env("MCP_DISCORD_TOKEN_HEADER", "X-Discord-Bot-Token")
     discord_max_upload_bytes: int = _get_int("DISCORD_MAX_UPLOAD_BYTES", 25_000_000)
     discord_export_enabled: bool = _get_bool("DISCORD_EXPORT_ENABLED", False)
     discord_allowed_channel_ids: list[str] = field(
@@ -524,6 +525,22 @@ class Settings:
             "x-request-id",
         }:
             errors.append("MCP_PORTAL_GRANT_HEADER must be distinct from protected headers")
+        if not re.fullmatch(r"[A-Za-z0-9-]+", self.discord_token_header):
+            errors.append("MCP_DISCORD_TOKEN_HEADER must be a valid single header name")
+        if self.discord_token_header.lower() in {
+            "authorization",
+            self.portal_grant_header.lower(),
+            self.portal_subject_header.lower(),
+            "host",
+            "origin",
+            "content-length",
+            "content-type",
+            "accept",
+            "transfer-encoding",
+            "cookie",
+            "x-request-id",
+        }:
+            errors.append("MCP_DISCORD_TOKEN_HEADER must be distinct from protected headers")
         if not self.allowed_hosts or any(not _is_exact_host(value) for value in self.allowed_hosts):
             errors.append("MCP_ALLOWED_HOSTS must contain exact hosts and no wildcards")
         if any(not _is_exact_origin(value) for value in self.allowed_origins):

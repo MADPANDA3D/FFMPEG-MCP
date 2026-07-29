@@ -175,6 +175,11 @@ REQUEST_CONTEXT: contextvars.ContextVar[dict[str, Any] | None] = contextvars.Con
     "request_context", default=None
 )
 
+
+def _current_request_context() -> dict[str, Any]:
+    return dict(REQUEST_CONTEXT.get() or {})
+
+
 SYNC_TOOL_NAMES = {
     "brand_kit_delete",
     "brand_kit_get",
@@ -3486,12 +3491,16 @@ async def tool_export_to_discord(
         if not os.path.exists(path):
             raise ValueError("asset file missing")
         send_name = filename or asset.get("original_filename") or f"{asset_id}"
+        request_context = _current_request_context()
         message_id = await send_file(
             channel_id=channel_id,
             file_path=path,
             filename=send_name,
             message=message,
             mime_type=asset.get("mime_type"),
+            discord_bot_token=request_context.get("discord_bot_token"),
+            allow_environment_fallback=settings.mcp_mode == "standalone",
+            require_allowlisted_channel=settings.mcp_mode == "standalone",
         )
     except DiscordExportError as exc:
         raise ValueError("Discord export failed") from exc
@@ -3547,8 +3556,10 @@ def _configuration_status() -> dict[str, Any]:
         ),
         "discord_export_configured": bool(
             settings.discord_export_enabled
-            and settings.discord_bot_token
-            and settings.discord_allowed_channel_ids
+            and (
+                settings.mcp_mode == "portal"
+                or (settings.discord_bot_token and settings.discord_allowed_channel_ids)
+            )
         ),
         "s3_storage_active": settings.storage_backend == "s3",
     }
@@ -3874,12 +3885,31 @@ def _safe_request_id(scope: dict) -> str:
     return uuid.uuid4().hex
 
 
+def _request_scoped_discord_token(scope: dict) -> str | None:
+    token = _single_header(scope, settings.discord_token_header)
+    if token is None:
+        return None
+    if (
+        token != token.strip()
+        or not 20 <= len(token) <= 512
+        or any(ord(character) < 33 or ord(character) == 127 for character in token)
+    ):
+        raise ValueError("invalid protected credential header")
+    return token
+
+
 def _authenticate(scope: dict) -> str:
     authorization = _single_header(scope, "authorization")
     grant = _single_header(scope, settings.portal_grant_header)
     subject = _single_header(scope, settings.portal_subject_header)
+    discord_token = _request_scoped_discord_token(scope)
     if settings.mcp_mode == "standalone":
-        if grant is not None or subject is not None or authorization is None:
+        if (
+            grant is not None
+            or subject is not None
+            or discord_token is not None
+            or authorization is None
+        ):
             raise PermissionError("unauthorized")
         bearer = re.fullmatch(r"(?i:Bearer) ([^\s\x00-\x1f\x7f]+)", authorization)
         if bearer is None or not hmac.compare_digest(bearer.group(1), settings.mcp_access_token):
@@ -4069,6 +4099,7 @@ def build_app():
         request_id = _safe_request_id(scope)
         started_at = time.perf_counter()
         owner_hash: str | None = None
+        discord_bot_token: str | None = None
         tool_name: str | None = None
         jsonrpc_id: str | int = "server-error"
         bytes_in = 0
@@ -4077,6 +4108,7 @@ def build_app():
         try:
             try:
                 owner_hash = _authenticate(scope)
+                discord_bot_token = _request_scoped_discord_token(scope)
             except (PermissionError, ValueError):
                 status_code = 401
                 bytes_out = await _send_jsonrpc_error(
@@ -4240,7 +4272,11 @@ def build_app():
                     )
             inner_scope = {**scope, "headers": safe_headers}
             request_context_token = REQUEST_CONTEXT.set(
-                {"request_id": request_id, "owner_hash": owner_hash}
+                {
+                    "request_id": request_id,
+                    "owner_hash": owner_hash,
+                    "discord_bot_token": discord_bot_token,
+                }
             )
             try:
                 with tenant_context(owner_hash):

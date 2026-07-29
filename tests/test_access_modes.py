@@ -93,6 +93,7 @@ class AccessModeTests(unittest.IsolatedAsyncioTestCase):
         async def inner(scope, receive, send):
             captured["headers"] = list(scope["headers"])
             captured["owner_hash"] = server.require_owner_hash()
+            captured["request_context"] = dict(server.REQUEST_CONTEXT.get() or {})
             await receive()
             payload = b'{"ok":true}'
             await send(
@@ -184,6 +185,7 @@ class AccessModeTests(unittest.IsolatedAsyncioTestCase):
         headers = _base_headers("portal") + [
             (b"cookie", b"session=secret"),
             (b"x-forwarded-host", b"evil.example"),
+            (b"x-discord-bot-token", b"request-scoped-discord-token"),
         ]
         with (
             patch.object(server, "settings", configured),
@@ -195,8 +197,39 @@ class AccessModeTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(b"authorization", forwarded_names)
         self.assertNotIn(b"x-madpanda-portal-grant", forwarded_names)
         self.assertNotIn(b"x-madpanda-portal-subject", forwarded_names)
+        self.assertNotIn(b"x-discord-bot-token", forwarded_names)
         self.assertNotIn(b"cookie", forwarded_names)
         self.assertFalse(any(name.startswith(b"x-forwarded-") for name in forwarded_names))
+        self.assertEqual(
+            captured["request_context"]["discord_bot_token"],
+            "request-scoped-discord-token",
+        )
+
+    async def test_discord_byok_header_is_portal_only_and_duplicate_safe(self):
+        standalone = _settings()
+        standalone_app = await self._app(standalone)
+        with patch.object(server, "settings", standalone):
+            status, _, reads, _ = await _invoke(
+                standalone_app,
+                headers=_base_headers()
+                + [(b"x-discord-bot-token", b"request-scoped-discord-token")],
+            )
+        self.assertEqual(status, 401)
+        self.assertEqual(reads, 0)
+
+        portal = _settings("portal")
+        portal_app = await self._app(portal)
+        duplicate = [
+            (b"x-discord-bot-token", b"request-scoped-discord-token"),
+            (b"x-discord-bot-token", b"second-request-scoped-token"),
+        ]
+        with patch.object(server, "settings", portal):
+            status, _, reads, _ = await _invoke(
+                portal_app,
+                headers=_base_headers("portal") + duplicate,
+            )
+        self.assertEqual(status, 401)
+        self.assertEqual(reads, 0)
 
     async def test_exact_origin_and_normalized_ipv6_host(self):
         configured = _settings()

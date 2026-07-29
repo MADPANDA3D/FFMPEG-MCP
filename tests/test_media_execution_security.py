@@ -314,6 +314,7 @@ class BoundedProcessTests(unittest.TestCase):
 
 def _discord_settings(**overrides):
     values = {
+        "mcp_mode": "standalone",
         "discord_bot_token": "test-token",
         "discord_allowed_channel_ids": ["123"],
         "discord_max_upload_bytes": 1024,
@@ -357,6 +358,7 @@ class DiscordBoundaryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(requests[0].url.scheme, "https")
         self.assertEqual(requests[0].url.host, "discord.com")
         self.assertEqual(requests[0].url.path, "/api/v10/channels/123/messages")
+        self.assertEqual(requests[0].headers["Authorization"], "Bot test-token")
 
     async def test_export_fails_closed_without_destination_allowlist(self):
         with (
@@ -374,6 +376,73 @@ class DiscordBoundaryTests(unittest.IsolatedAsyncioTestCase):
                 filename="media.mp4",
                 message=None,
                 mime_type="video/mp4",
+            )
+
+    async def test_portal_export_uses_only_request_scoped_byok(self):
+        requests: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            return httpx.Response(200, json={"id": "message-2"})
+
+        client = httpx.AsyncClient(
+            transport=httpx.MockTransport(handler),
+            follow_redirects=False,
+            trust_env=False,
+        )
+        with tempfile.NamedTemporaryFile() as handle:
+            handle.write(b"media")
+            handle.flush()
+            with (
+                patch.object(
+                    discord_export,
+                    "settings",
+                    _discord_settings(
+                        mcp_mode="portal",
+                        discord_bot_token="must-not-be-used",
+                        discord_allowed_channel_ids=[],
+                    ),
+                ),
+                patch.object(discord_export, "_build_http_client", return_value=client),
+            ):
+                message_id = await discord_export.send_file(
+                    channel_id="456",
+                    file_path=handle.name,
+                    filename="media.mp4",
+                    message=None,
+                    mime_type="video/mp4",
+                    discord_bot_token="calling-user-token",
+                    allow_environment_fallback=False,
+                    require_allowlisted_channel=False,
+                )
+
+        self.assertEqual(message_id, "message-2")
+        self.assertEqual(requests[0].headers["Authorization"], "Bot calling-user-token")
+
+    async def test_portal_export_fails_closed_without_request_scoped_byok(self):
+        with (
+            tempfile.NamedTemporaryFile() as handle,
+            patch.object(
+                discord_export,
+                "settings",
+                _discord_settings(
+                    mcp_mode="portal",
+                    discord_bot_token="must-not-be-used",
+                    discord_allowed_channel_ids=[],
+                ),
+            ),
+            self.assertRaisesRegex(
+                discord_export.DiscordExportError, "request-scoped Discord BYOK"
+            ),
+        ):
+            await discord_export.send_file(
+                channel_id="456",
+                file_path=handle.name,
+                filename="media.mp4",
+                message=None,
+                mime_type="video/mp4",
+                allow_environment_fallback=False,
+                require_allowlisted_channel=False,
             )
 
     async def test_bounded_discord_response_rejects_oversize_body(self):
