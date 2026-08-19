@@ -12,6 +12,9 @@ from madpanda_ffmpeg_mcp.tool_manifest import (
     build_tool_manifest,
 )
 
+FROZEN_DESCRIPTOR_HASH = "da5a754f4b6ef464d1b613d70e4c90139f4d1d50b980c2cafed56b61e9d51b7b"
+FROZEN_COMPATIBILITY_HASH = "cc6b33af31446e0c5431cc0d5b02ad13c9acfbfb80e7a58b5459e085c69f83f9"
+
 
 class ToolManifestTests(unittest.TestCase):
     def test_manifest_is_lossless_complete_and_registry_owned(self) -> None:
@@ -120,6 +123,32 @@ class ToolManifestTests(unittest.TestCase):
             capability["outputSchema"]["properties"]["tools"]["items"],
             {"$ref": "#/$defs/toolDescriptor"},
         )
+
+    def test_standard_v1_2_compatibility_contract_is_frozen(self) -> None:
+        manifest = build_tool_manifest(server.TOOL_REGISTRY)
+        compatibility_projection = [
+            {
+                key: descriptor[key]
+                for key in (
+                    "nativeToolName",
+                    "aliases",
+                    "inputSchema",
+                    "outputSchema",
+                    "annotations",
+                    "confirmation",
+                )
+            }
+            for descriptor in manifest["tools"]
+        ]
+        encoded = json.dumps(
+            compatibility_projection,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+
+        self.assertEqual(manifest["descriptorHash"], FROZEN_DESCRIPTOR_HASH)
+        self.assertEqual(hashlib.sha256(encoded).hexdigest(), FROZEN_COMPATIBILITY_HASH)
 
     def test_descriptor_hash_excludes_runtime_build_sha(self) -> None:
         with patch.dict(os.environ, {"MCP_BUILD_SHA": "abcdef1234567"}, clear=False):

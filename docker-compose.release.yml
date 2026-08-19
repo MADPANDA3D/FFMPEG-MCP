@@ -170,6 +170,11 @@ services:
 
   worker:
     <<: *runtime
+    depends_on:
+      ffmpeg-mcp:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
     command: [mad-mcp-ffmpeg-worker]
     environment: *processing-environment
     mem_limit: 4g
