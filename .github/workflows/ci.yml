@@ -157,8 +157,8 @@ jobs:
           from madpanda_ffmpeg_mcp import __version__
           from madpanda_ffmpeg_mcp.server import TOOL_REGISTRY, _current_tool_manifest
 
-          assert version('mad-mcp-ffmpeg') == '1.0.0'
-          assert __version__ == '1.0.0'
+          assert version('mad-mcp-ffmpeg') == '1.0.1'
+          assert __version__ == '1.0.1'
           manifest = _current_tool_manifest()
           assert len(TOOL_REGISTRY) == 55
           assert manifest['catalogVersion'] == '2026-07-18.4'
@@ -361,7 +361,7 @@ jobs:
           docker build \
             --build-arg BUILD_SHA="$GITHUB_SHA" \
             --build-arg SOURCE_FINGERPRINT="$SOURCE_FINGERPRINT" \
-            --build-arg IMAGE_VERSION=1.0.0 \
+            --build-arg IMAGE_VERSION=1.0.1 \
             --tag ffmpeg-mcp:ci \
             .
       - name: Smoke the supplied standalone and Portal stacks
