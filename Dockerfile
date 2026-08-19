@@ -27,7 +27,7 @@ FROM python:3.12.13-slim-bookworm@sha256:72d3d75f2639ab82b34b29390ad3d6e0827c775
 
 ARG BUILD_SHA=development
 ARG SOURCE_FINGERPRINT=development
-ARG IMAGE_VERSION=1.0.0
+ARG IMAGE_VERSION=1.0.1
 
 LABEL org.opencontainers.image.title="MADPANDA3D FFMPEG MCP" \
       org.opencontainers.image.description="Dual-mode asynchronous FFmpeg media MCP server" \

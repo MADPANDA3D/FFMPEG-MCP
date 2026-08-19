@@ -6,7 +6,7 @@ x-image: &source-image
     args:
       BUILD_SHA: ${MCP_BUILD_SHA:-development}
       SOURCE_FINGERPRINT: ${MCP_SOURCE_FINGERPRINT:-development}
-      IMAGE_VERSION: ${MCP_IMAGE_VERSION:-1.0.0}
+      IMAGE_VERSION: ${MCP_IMAGE_VERSION:-1.0.1}
   image: ffmpeg-mcp:local-source
 
 x-runtime: &runtime
