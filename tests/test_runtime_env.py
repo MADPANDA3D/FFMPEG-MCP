@@ -3,10 +3,26 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import yaml
+
 from scripts import init_runtime_env
 
 
 class RuntimeEnvironmentInitializerTests(unittest.TestCase):
+    def test_workers_wait_for_shared_volume_initialization(self) -> None:
+        repository = Path(__file__).parents[1]
+        for manifest_path in sorted(repository.glob("docker-compose*.yml")):
+            manifest = yaml.safe_load(manifest_path.read_text(encoding="utf-8"))
+            dependencies = manifest["services"]["worker"]["depends_on"]
+            with self.subTest(manifest=manifest_path.name):
+                self.assertEqual(set(dependencies), {"ffmpeg-mcp", "redis"})
+                self.assertTrue(
+                    all(
+                        dependency["condition"] == "service_healthy"
+                        for dependency in dependencies.values()
+                    )
+                )
+
     def test_portal_mode_requires_and_records_an_exact_public_origin(self) -> None:
         with self.assertRaisesRegex(ValueError, "required in Portal mode"):
             init_runtime_env.build_environment("portal")
