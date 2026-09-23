@@ -9,4 +9,3 @@ __pycache__
 *.py[cod]
 *.bak*
 data
-tests
