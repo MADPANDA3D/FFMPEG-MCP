@@ -19,7 +19,7 @@ from typing import Any, get_args, get_origin, get_type_hints
 
 SCHEMA_VERSION = "1.0.0"
 SERVICE_ID = "ffmpeg"
-CATALOG_VERSION = "2026-07-12.3"
+CATALOG_VERSION = "2026-09-23.1"
 DOCUMENTATION_URL = "https://github.com/MADPANDA3D/FFMPEG-MCP"
 
 
@@ -270,6 +270,18 @@ TOOL_DESCRIPTIONS: dict[str, str] = {
         "optional message. It writes to an external system and requires configured "
         "Discord credentials."
     ),
+    "media_upload_begin": ("Begin a bounded direct workstation upload and return a short-lived HTTP PUT URL plus the exact MIME, size, and SHA-256 contract required for safe completion."),
+    "media_upload_complete": ("Verify a completed direct upload byte-for-byte, deduplicate it by SHA-256, and promote it into the durable reusable clip library without exposing storage paths."),
+    "clip_library_list": ("Search the durable reusable clip library by privacy-safe text and tags, optionally including archived records, without returning storage credentials or private paths."),
+    "clip_library_get": ("Read one privacy-safe durable clip record including provenance, approval, visual role, orientation, duration, tags, and content digest metadata."),
+    "clip_library_update": ("Update bounded searchable metadata for one durable reusable clip while preserving the original media bytes and immutable SHA-256 identity."),
+    "clip_library_archive": ("Archive one durable clip from normal search results without deleting or mutating its original media bytes, provenance, or content digest."),
+    "template_version_upsert": ("Create a new immutable version of an agent-authored render template definition with a change note, preserving every earlier approved version for rollback and audit."),
+    "template_version_get": ("Read the latest or one exact immutable version of an agent-authored render template without changing persistent template state."),
+    "template_version_list": ("List the latest records for all versioned agent-authored render templates so agents can select approved production contracts safely."),
+    "madpanda_reel_contract": ("Return the approved MADPANDA3D 1080x1920 Reel canvas, shaped audio chain, 5.5-second versioned outro, codec, loudness, and 30-45 second delivery constraints."),
+    "madpanda_reel_validate": ("Validate and fingerprint an ordered MADPANDA3D Reel assembly plan before rendering, including required narration, music, outro, shots, trims, and 30-45 second duration."),
+    "madpanda_reel_render": ("Dry-run or queue an approved MADPANDA3D 30-45 second vertical Reel through the existing bounded workflow engine after validating clips, narration, music, outro, and delivery constraints."),
 }
 
 
@@ -284,6 +296,12 @@ CATEGORY_TOOLS: dict[str, tuple[str, ...]] = {
     "ingest_storage": (
         "media_ingest_from_url",
         "media_ingest_from_drive",
+        "media_upload_begin",
+        "media_upload_complete",
+        "clip_library_list",
+        "clip_library_get",
+        "clip_library_update",
+        "clip_library_archive",
         "media_probe",
         "media_get_download_url",
         "media_export_to_drive",
@@ -320,6 +338,9 @@ CATEGORY_TOOLS: dict[str, tuple[str, ...]] = {
         "brand_kit_list",
         "brand_kit_delete",
         "brand_kit_apply",
+        "template_version_upsert",
+        "template_version_get",
+        "template_version_list",
     ),
     "batch_workflow": (
         "batch_export_formats",
@@ -330,6 +351,9 @@ CATEGORY_TOOLS: dict[str, tuple[str, ...]] = {
         "render_offer_card",
         "render_iterate",
         "workflow_run",
+        "madpanda_reel_contract",
+        "madpanda_reel_validate",
+        "madpanda_reel_render",
     ),
     "reference_operations": (
         "ffmpeg_list_presets",
@@ -380,6 +404,12 @@ ALIASES: dict[str, tuple[str, ...]] = {
     "job_progress": ("get_job_progress",),
     "job_logs": ("get_job_logs",),
     "media_get_download_url": ("get_download_url",),
+    "media_upload_begin": ("begin_direct_upload",),
+    "media_upload_complete": ("complete_direct_upload",),
+    "clip_library_list": ("search_clips", "list_clips"),
+    "template_version_upsert": ("template_upsert", "template_create_version"),
+    "madpanda_reel_validate": ("validate_reel_plan",),
+    "madpanda_reel_render": ("render_vertical_reel",),
     "media_export_to_drive": ("export_to_drive",),
     "media_export_to_discord": ("export_to_discord",),
 }
@@ -405,16 +435,25 @@ READ_ONLY_TOOLS = {
     "job_logs",
     "metrics_snapshot",
     "media_get_download_url",
+    "clip_library_list",
+    "clip_library_get",
+    "template_version_get",
+    "template_version_list",
+    "madpanda_reel_contract",
+    "madpanda_reel_validate",
 }
 DESTRUCTIVE_TOOLS = {"brand_kit_delete"}
 OPEN_WORLD_TOOLS = {
     "media_ingest_from_url",
     "media_ingest_from_drive",
+    "media_upload_begin",
     "media_export_to_drive",
     "media_export_to_discord",
 }
 IDEMPOTENT_TOOLS = READ_ONLY_TOOLS | {
     "brand_kit_upsert",
+    "clip_library_update",
+    "clip_library_archive",
     "brand_kit_delete",
 }
 CONFIRMATION_PHRASES = {"brand_kit_delete": "DELETE BRAND KIT"}
@@ -830,6 +869,96 @@ def _output_schema(name: str) -> dict[str, Any]:
             ),
         }
         required = ["job_id", "cache_hit"]
+    elif name == "media_upload_begin":
+        properties = {
+            "upload_id": _property("string", "Opaque ID for completing this upload."),
+            "upload_url": _property("string", "Short-lived direct PUT URL."),
+            "method": _property("string", "Required HTTP upload method."),
+            "required_headers": _object_property(
+                "Required content type and checksum request headers."
+            ),
+            "expires_at": _property("integer", "Unix upload-session expiry."),
+            "max_size_bytes": _property("integer", "Maximum accepted upload size."),
+        }
+        required = [
+            "upload_id",
+            "upload_url",
+            "method",
+            "required_headers",
+            "expires_at",
+            "max_size_bytes",
+        ]
+    elif name == "media_upload_complete":
+        properties = {
+            "clip": _object_property("Privacy-safe durable clip record."),
+            "deduplicated": _property(
+                "boolean", "Whether an existing SHA-256-identical clip was reused."
+            ),
+        }
+        required = ["clip", "deduplicated"]
+    elif name == "clip_library_list":
+        properties = {
+            "clips": _property(
+                "array",
+                "Privacy-safe durable clip records matching the filters.",
+                items={"type": "object", "additionalProperties": True},
+            ),
+            "count": _property("integer", "Number of returned clip records."),
+        }
+        required = ["clips", "count"]
+    elif name in {"clip_library_get", "clip_library_update", "clip_library_archive"}:
+        properties = {
+            "clip": _object_property("Privacy-safe durable clip record.")
+        }
+        required = ["clip"]
+    elif name in {"template_version_upsert", "template_version_get"}:
+        properties = {
+            "template": _object_property("Immutable versioned template record.")
+        }
+        required = ["template"]
+    elif name == "template_version_list":
+        properties = {
+            "templates": _property(
+                "array",
+                "Latest immutable records for versioned templates.",
+                items={"type": "object", "additionalProperties": True},
+            ),
+            "count": _property("integer", "Number of returned templates."),
+        }
+        required = ["templates", "count"]
+    elif name == "madpanda_reel_contract":
+        properties = {
+            "contract": _object_property(
+                "Approved MADPANDA3D vertical-Reel production contract."
+            )
+        }
+        required = ["contract"]
+    elif name == "madpanda_reel_validate":
+        properties = {
+            "ok": _property("boolean", "Whether the Reel plan satisfies the contract."),
+            "errors": _property(
+                "array", "Bounded validation errors.", items={"type": "string"}
+            ),
+            "contract": _object_property("Contract used for plan validation."),
+            "input_fingerprint": _property(
+                "string", "SHA-256 fingerprint of the canonical input plan."
+            ),
+        }
+        required = ["ok", "errors", "contract", "input_fingerprint"]
+    elif name == "madpanda_reel_render":
+        properties = {
+            "dry_run": _property("boolean", "Whether processing was planned only."),
+            "validation": _object_property("Validated Reel plan result for dry runs."),
+            "workflow": _object_property("Bounded workflow graph for dry runs."),
+            "job_id": _property("string", "Queued workflow job ID for live renders."),
+            "cache_hit": _property(
+                "boolean", "Whether an identical completed render was reused."
+            ),
+            "input_fingerprint": _property(
+                "string", "SHA-256 fingerprint of the canonical input plan."
+            ),
+        }
+        required = ["dry_run"]
     elif name == "media_ingest_from_url" or name == "media_ingest_from_drive":
         properties = {
             "asset_id": _property("string", "Stable staged-media asset ID."),

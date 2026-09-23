@@ -81,6 +81,20 @@ from overlay_utils import (
 )
 from presets import describe_preset, get_preset, list_presets
 from rubrics import describe_rubric, get_rubric, list_rubrics, qa_from_report
+from reel_library import (
+    MADPANDA_REEL_CONTRACT,
+    archive_clip,
+    begin_upload,
+    complete_upload,
+    get_clip,
+    get_template as get_versioned_template,
+    get_upload,
+    list_clips,
+    list_versioned_templates,
+    save_template as save_versioned_template,
+    update_clip,
+    validate_reel_plan,
+)
 from templates import describe_template, list_templates
 from task_queue import get_queue
 from tool_manifest import (
@@ -153,6 +167,11 @@ SYNC_TOOL_NAMES = {
     "rubric_list",
     "template_describe",
     "template_list",
+    "clip_library_get",
+    "clip_library_list",
+    "template_version_get",
+    "template_version_list",
+    "madpanda_reel_contract",
 }
 
 
@@ -546,6 +565,44 @@ async def _download_handler(scope, receive, send) -> None:
                 break
             await send({"type": "http.response.body", "body": chunk, "more_body": True})
     await send({"type": "http.response.body", "body": b"", "more_body": False})
+
+
+async def _upload_handler(scope, receive, send) -> None:
+    upload_id = scope.get("path", "").rsplit("/", 1)[-1]
+    session = get_upload(upload_id)
+    if scope.get("method") != "PUT":
+        await _send_json(send, 405, {"ok": False, "error": "PUT required"})
+        return
+    if not session or int(session["expires_at"]) <= utc_now_ts():
+        await _send_json(send, 404, {"ok": False, "error": "upload not found or expired"})
+        return
+    if _extract_header(scope, "content-type") != session["mime_type"] or _extract_header(scope, "x-content-sha256") != session["sha256"]:
+        await _send_json(send, 400, {"ok": False, "error": "upload headers do not match declaration"})
+        return
+    os.makedirs(os.path.dirname(session["temp_path"]), exist_ok=True)
+    total = 0
+    import hashlib
+    digest = hashlib.sha256()
+    try:
+        async with aiofiles.open(session["temp_path"], "wb") as handle:
+            while True:
+                message = await receive()
+                chunk = message.get("body", b"")
+                total += len(chunk)
+                if total > int(session["size_bytes"]):
+                    raise ValueError("upload exceeds declared size")
+                digest.update(chunk)
+                await handle.write(chunk)
+                if not message.get("more_body", False):
+                    break
+        if total != int(session["size_bytes"]) or digest.hexdigest() != session["sha256"]:
+            raise ValueError("uploaded bytes do not match declared size and sha256")
+    except ValueError as exc:
+        if os.path.exists(session["temp_path"]):
+            os.remove(session["temp_path"])
+        await _send_json(send, 400, {"ok": False, "error": str(exc)})
+        return
+    await _send_json(send, 201, {"ok": True, "upload_id": upload_id, "size_bytes": total, "sha256": digest.hexdigest()})
 
 
 def _map_rq_status(status: str) -> str:
@@ -3444,12 +3501,99 @@ async def tool_find_tools(
     }
 
 
+async def tool_media_upload_begin(
+    filename: str, mime_type: str, size_bytes: int, sha256: str
+) -> dict[str, Any]:
+    return begin_upload(filename, mime_type, size_bytes, sha256)
+
+
+async def tool_media_upload_complete(
+    upload_id: str, metadata: dict | None = None
+) -> dict[str, Any]:
+    return complete_upload(upload_id, metadata)
+
+
+async def tool_clip_library_list(
+    query: str | None = None,
+    tags: list[str] | None = None,
+    include_archived: bool = False,
+) -> dict[str, Any]:
+    clips = list_clips(query, tags, include_archived)
+    return {"clips": clips, "count": len(clips)}
+
+
+async def tool_clip_library_get(clip_id: str) -> dict[str, Any]:
+    return {"clip": get_clip(clip_id)}
+
+
+async def tool_clip_library_update(
+    clip_id: str, metadata: dict
+) -> dict[str, Any]:
+    return {"clip": update_clip(clip_id, metadata)}
+
+
+async def tool_clip_library_archive(clip_id: str) -> dict[str, Any]:
+    return {"clip": archive_clip(clip_id)}
+
+
+async def tool_template_version_upsert(
+    template_id: str, definition: dict, change_note: str
+) -> dict[str, Any]:
+    return {"template": save_versioned_template(template_id, definition, change_note)}
+
+
+async def tool_template_version_get(
+    template_id: str, version: int | None = None
+) -> dict[str, Any]:
+    return {"template": get_versioned_template(template_id, version)}
+
+
+async def tool_template_version_list() -> dict[str, Any]:
+    templates = list_versioned_templates()
+    return {"templates": templates, "count": len(templates)}
+
+
+async def tool_madpanda_reel_contract() -> dict[str, Any]:
+    return {"contract": MADPANDA_REEL_CONTRACT}
+
+
+async def tool_madpanda_reel_validate(plan: dict) -> dict[str, Any]:
+    return validate_reel_plan(plan)
+
+
+async def tool_madpanda_reel_render(
+    plan: dict, dry_run: bool = True, priority: str | None = None
+) -> dict[str, Any]:
+    validation = validate_reel_plan(plan)
+    if not validation["ok"]:
+        raise ValueError("invalid MADPANDA3D Reel plan: " + "; ".join(validation["errors"]))
+    workflow = plan.get("workflow")
+    if not isinstance(workflow, dict):
+        raise ValueError("plan.workflow must contain the bounded existing workflow graph")
+    if dry_run:
+        return {"dry_run": True, "validation": validation, "workflow": workflow}
+    result = await tool_workflow_run(workflow, priority)
+    return {**result, "dry_run": False, "input_fingerprint": validation["input_fingerprint"]}
+
+
 TOOL_REGISTRY: dict[str, Callable[..., Awaitable[dict]]] = {
     "check_configuration": tool_check_configuration,
     "list_capabilities": tool_list_capabilities,
     "get_endpoint_coverage": tool_get_endpoint_coverage,
     "get_tool_usage": tool_get_tool_usage,
     "find_tools": tool_find_tools,
+    "media_upload_begin": tool_media_upload_begin,
+    "media_upload_complete": tool_media_upload_complete,
+    "clip_library_list": tool_clip_library_list,
+    "clip_library_get": tool_clip_library_get,
+    "clip_library_update": tool_clip_library_update,
+    "clip_library_archive": tool_clip_library_archive,
+    "template_version_upsert": tool_template_version_upsert,
+    "template_version_get": tool_template_version_get,
+    "template_version_list": tool_template_version_list,
+    "madpanda_reel_contract": tool_madpanda_reel_contract,
+    "madpanda_reel_validate": tool_madpanda_reel_validate,
+    "madpanda_reel_render": tool_madpanda_reel_render,
     "media_ingest_from_url": tool_ingest_from_url,
     "media_ingest_from_drive": tool_ingest_from_drive,
     "media_probe": tool_probe,
@@ -3570,6 +3714,8 @@ if __name__ == "__main__":
         async def router(scope, receive, send):
             if scope.get("type") == "http" and scope.get("path", "").startswith("/download/"):
                 return await _download_handler(scope, receive, send)
+            if scope.get("type") == "http" and scope.get("path", "").startswith("/upload/"):
+                return await _upload_handler(scope, receive, send)
             return await app(scope, receive, send)
 
         async def host_override(scope, receive, send):

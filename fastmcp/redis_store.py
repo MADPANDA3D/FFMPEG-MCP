@@ -58,6 +58,8 @@ def save_asset(asset: dict[str, Any], ttl_seconds: int) -> None:
 def get_asset(asset_id: str) -> dict[str, Any] | None:
     client = get_redis()
     raw = client.get(f"{ASSET_PREFIX}{asset_id}")
+    if not raw and asset_id.startswith("clip_"):
+        raw = client.get(f"reel:clip:{asset_id}")
     if not raw:
         return None
     return json.loads(raw)
