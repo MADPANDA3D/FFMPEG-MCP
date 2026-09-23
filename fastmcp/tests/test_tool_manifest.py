@@ -35,8 +35,8 @@ class ToolManifestTests(unittest.TestCase):
         self.assertEqual(
             manifest["counts"],
             {
-                "raw": 55,
-                "agentReady": 55,
+                "raw": 67,
+                "agentReady": 67,
                 "legacy": 0,
                 "hidden": 0,
             },
@@ -186,7 +186,7 @@ class NavigationToolTests(unittest.IsolatedAsyncioTestCase):
         server.register_tools()
         tools = await server.mcp.list_tools()
 
-        self.assertEqual(len(tools), 55)
+        self.assertEqual(len(tools), 67)
         by_name = {tool.name: tool for tool in tools}
         navigation = {
             "check_configuration",
@@ -212,15 +212,15 @@ class NavigationToolTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result["schemaVersion"], SCHEMA_VERSION)
         self.assertEqual(result["serviceId"], SERVICE_ID)
-        self.assertEqual(len(result["tools"]), 55)
-        self.assertEqual(result["counts"]["raw"], 55)
+        self.assertEqual(len(result["tools"]), 67)
+        self.assertEqual(result["counts"]["raw"], 67)
         self.assertRegex(result["descriptorHash"], r"^[a-f0-9]{64}$")
 
     async def test_list_capabilities_is_compact_by_default(self) -> None:
         result = await server.tool_list_capabilities()
 
         self.assertEqual(result["tools"], [])
-        self.assertEqual(result["counts"]["agentReady"], 55)
+        self.assertEqual(result["counts"]["agentReady"], 67)
 
     async def test_find_tools_ranks_punctuation_normalized_multi_token_queries(
         self,
@@ -250,7 +250,7 @@ class NavigationToolTests(unittest.IsolatedAsyncioTestCase):
         result = await server.tool_get_endpoint_coverage()
 
         self.assertEqual(result["providerKind"], "local-cli")
-        self.assertEqual(len(result["entries"]), 55)
+        self.assertEqual(len(result["entries"]), 67)
         self.assertTrue(all(item["status"] == "covered" for item in result["entries"]))
 
     async def test_configuration_readback_contains_presence_only(self) -> None:

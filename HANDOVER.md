@@ -22,3 +22,24 @@
 - Bumped the FFmpeg catalog to `2026-07-12.2` and made destructive confirmation explicitly out-of-band.
 - `brand_kit_delete` still requires exact Portal phrase `DELETE BRAND KIT`; its manifest parameter is null because the native provider function consumes only `brand_kit_id`.
 - No runtime provider behavior or deployment changed.
+
+## 2026-09-23 - TKT-000470 Reusable Reel Pipeline
+
+- Status: implemented and locally validated; source changes intentionally left uncommitted for the host runner.
+- Added 12 agent-ready Portal tools for direct uploads, durable clip-library management, immutable template versions, and MADPANDA3D Reel contract validation/render delegation.
+- Direct upload completion enforces declared MIME, size, and SHA-256 and deduplicates durable originals by digest.
+- Reel plans use the existing bounded workflow engine and preserve all prior tool names and schemas.
+- Added focused tests and `docs/ffmpeg-skill-gap-assessment.md`; no reference source was copied.
+- Runner next: execute the configured dependency-complete test gate, rebuild/restart both API and worker, smoke `/health` for 67 tools, refresh Portal discovery, and exercise one safe synthetic end-to-end upload/dedup/render/preview/download flow.
+
+### 2026-09-23 repair cycle 2
+
+- Corrected `reel_library.py`, `tests/test_reel_library.py`, and the gap assessment from mode `0600` to `0644`; cycle-1 candidate validation had failed because the non-root container user could not read them.
+- Re-ran Python compilation, three focused Reel contract tests, 67-tool registry/manifest consistency, mode assertions, and `git diff --check`; all passed.
+- Source remains intentionally uncommitted for the host runner. The runner still owns the dependency-complete candidate gate, Compose rebuild/restart, production health/discovery/configuration smoke, and exact-SHA commit/push.
+
+### 2026-09-23 repair cycle 3
+
+- Added explicit ToolManifest output schemas for every new direct-upload, clip-library, versioned-template, and MADPANDA3D Reel tool after cycle-2 validation stopped at `clip_library_archive`.
+- Verified Python compilation, a dependency-free complete 67-descriptor manifest build with all 12 new output schemas, readable `0644` file modes, and `git diff --check`.
+- The sandbox host lacks runtime dependencies, so the host runner still owns the configured dependency-complete unittest gate and deployment smoke.

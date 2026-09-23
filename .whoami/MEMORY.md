@@ -53,3 +53,12 @@
 - `brand_kit_delete` is classified destructive and declares the exact Portal confirmation phrase `DELETE BRAND KIT`.
 - FFmpeg confirmation is intentionally out-of-band: `confirmation.parameter` is null and the phrase is consumed by `portal.call_destructive_tool`, not forwarded to the native `brand_kit_delete(brand_kit_id)` function.
 - The first implementation is committed on `feat/tool-manifest` and was not deployed during this slice.
+
+### 2026-09-23 — TKT-000470 reusable Reel production contract
+- Added direct checksum-bound HTTP PUT upload sessions and completion-time SHA-256/size validation.
+- Durable Redis clip records deduplicate originals by digest and expose searchable privacy-safe metadata; durable clip IDs also resolve through existing probe/render/download paths.
+- Added immutable versioned template records and a MADPANDA3D vertical Reel contract with the approved 30-45 second, 1080x1920/24 fps, audio-chain, and 5.5-second outro defaults.
+- Catalog version `2026-09-23.1` contains 67 agent-ready tools.
+- The dependency-independent focused suite and Python compilation pass in the sandbox; the host runner owns the dependency-complete suite, Compose rebuild/restart, and production smoke.
+- Repair cycle 2 corrected the three newly added files from mode `0600` to `0644`; the non-root API/worker images can now import the Reel module and its tests during host candidate validation.
+- Repair cycle 3 added explicit output schemas for all 12 new tools; the dependency-free manifest smoke now builds all 67 descriptors successfully instead of failing at `clip_library_archive`.
