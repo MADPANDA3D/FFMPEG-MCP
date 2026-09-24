@@ -113,3 +113,24 @@ class HostedContractTests(unittest.TestCase):
         self.assertEqual(payload["documented_tool_count"], 67)
         self.assertTrue(payload["configuration_ready"])
         self.assertTrue(payload["configuration"]["ready"])
+
+    def test_health_fails_closed_when_local_storage_is_not_writable(self):
+        configured = replace(
+            _grant_settings(),
+            redis_url="redis://test",
+            storage_backend="local",
+            storage_local_dir="/data/assets",
+            storage_temp_dir="/data/staging",
+            public_base_url="https://example.invalid",
+            download_signing_secret="configured",
+        )
+        with (
+            patch.object(server, "settings", configured),
+            patch.object(server.shutil, "which", return_value="/usr/bin/tool"),
+            patch.object(server.os, "access", return_value=False),
+        ):
+            payload = server._health_payload()
+
+        self.assertEqual(payload["status"], "degraded")
+        self.assertFalse(payload["configuration_ready"])
+        self.assertIn("storage_writable", payload["configuration"]["missing"])
