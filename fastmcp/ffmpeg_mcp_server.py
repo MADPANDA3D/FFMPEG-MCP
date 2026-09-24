@@ -3349,6 +3349,10 @@ def _current_tool_manifest() -> dict[str, Any]:
 
 
 def _configuration_status() -> dict[str, Any]:
+    local_storage_writable = settings.storage_backend != "local" or all(
+        os.path.isdir(path) and os.access(path, os.W_OK | os.X_OK)
+        for path in (settings.storage_local_dir, settings.storage_temp_dir)
+    )
     required = {
         "portal_grant_configured": bool(settings.portal_grant_secret),
         "redis_configured": bool(settings.redis_url),
@@ -3357,6 +3361,7 @@ def _configuration_status() -> dict[str, Any]:
             if settings.storage_backend == "local"
             else settings.s3_bucket and settings.s3_access_key and settings.s3_secret_key
         ),
+        "storage_writable": local_storage_writable,
         "download_signing_configured": bool(
             settings.public_base_url and settings.download_signing_secret
         ),
