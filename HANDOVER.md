@@ -43,3 +43,11 @@
 - Added explicit ToolManifest output schemas for every new direct-upload, clip-library, versioned-template, and MADPANDA3D Reel tool after cycle-2 validation stopped at `clip_library_archive`.
 - Verified Python compilation, a dependency-free complete 67-descriptor manifest build with all 12 new output schemas, readable `0644` file modes, and `git diff --check`.
 - The sandbox host lacks runtime dependencies, so the host runner still owns the configured dependency-complete unittest gate and deployment smoke.
+
+## 2026-09-24 - TKT-000473 Voice-Safe Background Mixing
+
+- Status: implemented and locally validated; source changes intentionally left uncommitted for the host runner.
+- Replaced the reused voice filter label with explicit sidechain and audible branches, and made ducking mode honor `voice_gain`.
+- Added implementation-version cache invalidation for direct and marketing-render background mixes.
+- Added a synthetic FFmpeg regression test; Python compilation, focused unittest, file-mode checks, and `git diff --check` pass.
+- The sandbox lacks service dependencies, so the host runner still owns the configured full unittest gate, Compose rebuild/restart, production health smoke, and a safe `audio_mix_with_background` acceptance smoke.

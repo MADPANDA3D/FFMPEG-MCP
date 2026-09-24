@@ -62,3 +62,8 @@
 - The dependency-independent focused suite and Python compilation pass in the sandbox; the host runner owns the dependency-complete suite, Compose rebuild/restart, and production smoke.
 - Repair cycle 2 corrected the three newly added files from mode `0600` to `0644`; the non-root API/worker images can now import the Reel module and its tests during host candidate validation.
 - Repair cycle 3 added explicit output schemas for all 12 new tools; the dependency-free manifest smoke now builds all 67 descriptors successfully instead of failing at `clip_library_archive`.
+
+### 2026-09-24 — TKT-000473 voice-safe background mixing
+- Corrected the ducking filtergraph to split the voice stream into distinct sidechain and audible branches before compression/mixing.
+- `voice_gain` now applies to the audible voice branch, and background-mix cache keys carry implementation version 2 so pre-fix cached assets are not reused.
+- Added a dependency-independent FFmpeg regression test using synthetic voice/music tones; the host runner owns the dependency-complete suite and production restart/smoke.
