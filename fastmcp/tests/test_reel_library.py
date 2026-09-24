@@ -112,7 +112,9 @@ class ReelLibraryTests(unittest.TestCase):
             "template_version": 1,
             "quality": "high",
         }
-        self.assertTrue(reel_library.validate_reel_plan(valid)["ok"])
+        validated = reel_library.validate_reel_plan(valid)
+        self.assertTrue(validated["ok"])
+        self.assertEqual(validated["contract"]["outro"]["sting_gain"], 0.12)
         invalid = {**valid, "duration_sec": 29, "outro_clip_id": ""}
         result = reel_library.validate_reel_plan(invalid)
         self.assertFalse(result["ok"])

@@ -226,7 +226,7 @@ MADPANDA_REEL_CONTRACT = {
     "duration_seconds": {"minimum": 30, "maximum": 45},
     "video": {"codec": "h264", "pixel_format": "yuv420p", "faststart": True},
     "audio": {"codec": "aac", "channels": 2, "sample_rate": 48000, "target_lufs": -14.0, "true_peak_dbtp": -1.5, "lra": 10.0, "voice_gain": 0.72, "highpass_hz": 70, "eq": [{"hz": 180, "q": 1.1, "gain_db": 1.2}, {"hz": 3000, "q": 1.2, "gain_db": 1.5}], "compressor": {"threshold": 0.125, "ratio": 2.0, "attack_ms": 15, "release_ms": 180, "makeup": 1.25}, "music_phases": [0.42, 0.30, 0.43], "sidechain": {"threshold": 0.025, "ratio": 3.0, "attack_ms": 10, "release_ms": 250}, "limiter": 0.95},
-    "outro": {"versioned": True, "default_duration_sec": 5.5},
+    "outro": {"versioned": True, "default_duration_sec": 5.5, "sting_gain": 0.12},
 }
 
 

@@ -286,6 +286,7 @@ def reel_render_job(
             filters.extend(
                 [
                     f"[{outro_index}:a:0]atrim=0:{outro_duration:.3f},asetpts=PTS-STARTPTS,"
+                    "volume=0.12,"
                     f"adelay={int(round(body_duration * 1000))}:all=1[sting]",
                     "[premix][sting]amix=inputs=2:duration=longest:normalize=0[premaster]",
                 ]
