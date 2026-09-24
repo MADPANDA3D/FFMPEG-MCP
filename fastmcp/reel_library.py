@@ -231,16 +231,70 @@ MADPANDA_REEL_CONTRACT = {
 
 
 def validate_reel_plan(plan: dict[str, Any]) -> dict[str, Any]:
-    duration = float(plan.get("duration_sec", 0))
     errors: list[str] = []
+    try:
+        duration = float(plan.get("duration_sec", 0))
+    except (TypeError, ValueError):
+        duration = 0
     if not 30 <= duration <= 45:
         errors.append("duration_sec must be between 30 and 45 inclusive")
+    try:
+        outro_duration = float(plan.get("outro_duration_sec", 5.5))
+    except (TypeError, ValueError):
+        outro_duration = 0
+    if not 0.5 <= outro_duration <= 10:
+        errors.append("outro_duration_sec must be between 0.5 and 10 seconds")
     shots = plan.get("shots")
-    if not isinstance(shots, list) or not shots:
+    shot_duration = 0.0
+    if not isinstance(shots, list) or not shots or len(shots) > 20:
         errors.append("shots must be a non-empty ordered array")
-    elif any(not isinstance(shot, dict) or not shot.get("clip_id") for shot in shots):
-        errors.append("every shot requires clip_id and may include source trims")
+    else:
+        for shot in shots:
+            if not isinstance(shot, dict) or not shot.get("clip_id"):
+                errors.append("every shot requires clip_id and may include source trims")
+                continue
+            try:
+                start = float(shot.get("start_sec", 0))
+                item_duration = float(shot.get("duration_sec", 0))
+            except (TypeError, ValueError):
+                start = -1
+                item_duration = 0
+            if start < 0 or item_duration <= 0:
+                errors.append("every shot requires non-negative start_sec and positive duration_sec")
+            shot_duration += max(item_duration, 0)
+    if duration and abs((shot_duration + outro_duration) - duration) > 0.05:
+        errors.append("shot durations plus outro_duration_sec must equal duration_sec")
     for required in ("narration_clip_id", "music_clip_id", "outro_clip_id"):
-        if not plan.get(required):
+        if not isinstance(plan.get(required), str) or not plan.get(required):
             errors.append(f"{required} is required")
-    return {"ok": not errors, "errors": errors, "contract": MADPANDA_REEL_CONTRACT, "input_fingerprint": hashlib.sha256(json.dumps(plan, sort_keys=True, separators=(",", ":")).encode()).hexdigest()}
+    if not isinstance(plan.get("template_id"), str) or not SAFE_ID.fullmatch(plan.get("template_id", "")):
+        errors.append("template_id is required and must be a safe identifier")
+    version = plan.get("template_version")
+    if version is not None and (not isinstance(version, int) or version < 1):
+        errors.append("template_version must be a positive integer")
+    if str(plan.get("quality") or "high").lower() not in {"standard", "high"}:
+        errors.append("quality must be standard or high")
+    overlays = plan.get("overlays") or []
+    if not isinstance(overlays, list) or len(overlays) > 12:
+        errors.append("overlays must be an array with at most 12 entries")
+    else:
+        for overlay in overlays:
+            if not isinstance(overlay, dict) or not isinstance(overlay.get("text"), str):
+                errors.append("every overlay requires text")
+                continue
+            try:
+                start = float(overlay.get("start_sec"))
+                end = float(overlay.get("end_sec"))
+            except (TypeError, ValueError):
+                start = -1
+                end = -1
+            if start < 0 or end <= start or end > duration:
+                errors.append("overlay times must be ordered within duration_sec")
+    return {
+        "ok": not errors,
+        "errors": errors,
+        "contract": MADPANDA_REEL_CONTRACT,
+        "input_fingerprint": hashlib.sha256(
+            json.dumps(plan, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest(),
+    }

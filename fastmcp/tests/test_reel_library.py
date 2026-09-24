@@ -96,18 +96,36 @@ class ReelLibraryTests(unittest.TestCase):
         self.assertEqual(reel_library.get_template("hostinger_reel")["version"], 2)
 
     def test_reel_contract_enforces_duration_and_required_tracks(self):
+        reel_library.save_template(
+            "madpanda_vertical_reel",
+            {"kind": "madpanda_vertical_reel"},
+            "approved synthetic QA template",
+        )
         valid = {
             "duration_sec": 35,
-            "shots": [{"clip_id": "clip_a", "start_sec": 0, "duration_sec": 5}],
+            "shots": [{"clip_id": "clip_a", "start_sec": 0, "duration_sec": 29.5}],
             "narration_clip_id": "clip_voice",
             "music_clip_id": "clip_music",
             "outro_clip_id": "clip_outro",
+            "outro_duration_sec": 5.5,
+            "template_id": "madpanda_vertical_reel",
+            "template_version": 1,
+            "quality": "high",
         }
         self.assertTrue(reel_library.validate_reel_plan(valid)["ok"])
         invalid = {**valid, "duration_sec": 29, "outro_clip_id": ""}
         result = reel_library.validate_reel_plan(invalid)
         self.assertFalse(result["ok"])
         self.assertEqual(len(result["input_fingerprint"]), 64)
+
+        mismatched = {
+            **valid,
+            "shots": [{"clip_id": "clip_a", "duration_sec": 20}],
+        }
+        self.assertIn(
+            "shot durations plus outro_duration_sec must equal duration_sec",
+            reel_library.validate_reel_plan(mismatched)["errors"],
+        )
 
 
 if __name__ == "__main__":

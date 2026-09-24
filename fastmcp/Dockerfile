@@ -1,12 +1,5 @@
 FROM python:3.12-slim
 
-ARG BUILD_SHA=unknown
-ARG BUILD_VERSION=2026-07-12.3
-
-LABEL org.opencontainers.image.title="MADPANDA3D FFmpeg MCP" \
-      org.opencontainers.image.revision="${BUILD_SHA}" \
-      org.opencontainers.image.version="${BUILD_VERSION}"
-
 WORKDIR /app
 
 RUN apt-get update \
@@ -15,6 +8,13 @@ RUN apt-get update \
 
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
+
+ARG BUILD_SHA=unknown
+ARG BUILD_VERSION=2026-07-12.3
+
+LABEL org.opencontainers.image.title="MADPANDA3D FFmpeg MCP" \
+      org.opencontainers.image.revision="${BUILD_SHA}" \
+      org.opencontainers.image.version="${BUILD_VERSION}"
 
 COPY . ./
 

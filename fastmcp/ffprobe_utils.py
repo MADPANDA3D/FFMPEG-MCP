@@ -52,11 +52,13 @@ def run_ffprobe(path: str) -> dict[str, Any]:
     height = None
     fps = None
     video_codec = None
+    pixel_format = None
     if video_stream:
         width = video_stream.get("width")
         height = video_stream.get("height")
         fps = _parse_fps(video_stream.get("avg_frame_rate"))
         video_codec = video_stream.get("codec_name")
+        pixel_format = video_stream.get("pix_fmt")
 
     audio_codec = None
     if audio_stream:
@@ -74,6 +76,7 @@ def run_ffprobe(path: str) -> dict[str, Any]:
                 "duration": stream.get("duration"),
                 "bit_rate": stream.get("bit_rate"),
                 "avg_frame_rate": stream.get("avg_frame_rate"),
+                "pixel_format": stream.get("pix_fmt"),
                 "sample_rate": stream.get("sample_rate"),
                 "channels": stream.get("channels"),
             }
@@ -85,6 +88,7 @@ def run_ffprobe(path: str) -> dict[str, Any]:
         "height": height,
         "fps": fps,
         "video_codec": video_codec,
+        "pixel_format": pixel_format,
         "audio_codec": audio_codec,
         "streams": normalized_streams,
     }
