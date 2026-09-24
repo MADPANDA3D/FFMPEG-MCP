@@ -29,6 +29,7 @@ from drive_utils import DriveError, upload_file
 from ffprobe_utils import run_ffprobe
 from ingest import IngestError, ingest_from_url
 from jobs import (
+    AUDIO_MIX_WITH_BACKGROUND_VERSION,
     asset_compare_job,
     audio_duck_job,
     audio_fade_job,
@@ -1801,6 +1802,7 @@ async def tool_audio_mix_with_background(
             "music_gain": music_gain,
             "voice_gain": voice_gain,
             "bitrate": bitrate,
+            "implementation_version": AUDIO_MIX_WITH_BACKGROUND_VERSION,
         },
     )
     cached_outputs = _resolve_cached_outputs(cache_key)

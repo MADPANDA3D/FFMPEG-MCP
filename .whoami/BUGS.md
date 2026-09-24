@@ -41,3 +41,10 @@ Before writing any code, scan this file for patterns relevant to what you're abo
 **Root cause:** The 12 new Reel workflow tools were added to registry metadata without corresponding branches in `_output_schema`.
 **Fix:** Added explicit output schemas matching every new handler's privacy-safe response shape and verified all 67 descriptors build.
 **Prevention:** Any registry addition must add its input/output contract in the same change and pass a complete manifest-build smoke.
+
+### 2026-09-24 — Background mix did not preserve an audible voice branch
+**Status:** [RESOLVED — 2026-09-24]
+**Symptom:** `audio_mix_with_background` could report success for an output containing the music bed but no audible voice.
+**Root cause:** The ducking graph reused one voice label as both the sidechain input and final mix input instead of explicitly splitting it into two FFmpeg branches; the wrapper also accepted `voice_gain` without applying it in ducking mode.
+**Fix:** Added an explicit `asplit`, applied `voice_gain` to the audible branch, and versioned affected cache keys to prevent reuse of pre-fix outputs.
+**Prevention:** Execute media filtergraphs with synthetic fixtures that prove every stream has a dedicated path to the final output.

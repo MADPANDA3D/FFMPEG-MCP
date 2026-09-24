@@ -9,6 +9,7 @@ from typing import Any
 
 from rq import get_current_job
 
+from audio_filters import audio_duck_filter_complex
 from captions import parse_captions_input, resolve_safe_zone_profile
 from config import settings
 from ffmpeg_utils import FfmpegError, run_ffmpeg
@@ -58,6 +59,7 @@ class JobError(RuntimeError):
 
 
 ITERATE_STRATEGIES = ("balanced", "captions_first", "audio_first", "framing_first")
+AUDIO_MIX_WITH_BACKGROUND_VERSION = 2
 
 FAIL_FAST_ERRORS = {
     "no_video_track": {
@@ -2362,6 +2364,7 @@ def audio_duck_job(
     bitrate: str | None,
     cache_key: str | None = None,
     job_id_override: str | None = None,
+    voice_gain: float | None = None,
 ) -> dict[str, Any]:
     job = get_current_job()
     job_id = job_id_override if job_id_override is not None else (job.id if job else "")
@@ -2395,6 +2398,7 @@ def audio_duck_job(
         attack_ms = int(attack_ms if attack_ms is not None else settings.ducking_attack_ms)
         release_ms = int(release_ms if release_ms is not None else settings.ducking_release_ms)
         music_gain = float(music_gain if music_gain is not None else settings.ducking_music_gain)
+        voice_gain = float(voice_gain) if voice_gain is not None else 1.0
         if ratio < 1 or ratio > 20:
             raise JobError("ratio out of range")
         if threshold <= 0 or threshold > 1:
@@ -2405,16 +2409,17 @@ def audio_duck_job(
             raise JobError("release_ms out of range")
         if music_gain <= 0 or music_gain > 4:
             raise JobError("music_gain out of range")
+        if voice_gain <= 0 or voice_gain > 4:
+            raise JobError("voice_gain out of range")
 
-        filter_complex = (
-            f"[0:a]aresample={settings.audio_sample_rate},"
-            "aformat=sample_fmts=fltp:channel_layouts=stereo,"
-            f"volume={music_gain}[music];"
-            f"[1:a]aresample={settings.audio_sample_rate},"
-            "aformat=sample_fmts=fltp:channel_layouts=stereo[voice];"
-            f"[music][voice]sidechaincompress=threshold={threshold}:"
-            f"ratio={ratio}:attack={attack_ms}:release={release_ms}[ducked];"
-            "[ducked][voice]amix=inputs=2:normalize=0:duration=longest[aout]"
+        filter_complex = audio_duck_filter_complex(
+            settings.audio_sample_rate,
+            ratio,
+            threshold,
+            attack_ms,
+            release_ms,
+            music_gain,
+            voice_gain,
         )
 
         mime_type, codec_args, ext = _audio_output_config(output_format, bitrate)
@@ -2519,6 +2524,7 @@ def audio_mix_with_background_job(
                 release_ms,
                 music_gain,
                 bitrate,
+                voice_gain=voice_gain,
                 cache_key=cache_key,
                 job_id_override="",
             )
@@ -4497,6 +4503,7 @@ def _render_marketing_job(
                         "music_gain": music_gain,
                         "voice_gain": voice_gain,
                         "bitrate": None,
+                        "implementation_version": AUDIO_MIX_WITH_BACKGROUND_VERSION,
                     },
                 )
                 cached_mix = _resolve_cached_output(mix_cache_key)
