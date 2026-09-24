@@ -104,7 +104,7 @@ class HostedContractTests(unittest.TestCase):
         self.assertEqual(payload["status"], "healthy")
         self.assertEqual(payload["service"], "ffmpeg-mcp")
         self.assertEqual(payload["build_sha"], "abcdef1234567890")
-        self.assertEqual(payload["catalog_version"], "2026-09-23.1")
+        self.assertEqual(payload["catalog_version"], "2026-09-23.2")
         self.assertEqual(len(payload["descriptor_hash"]), 64)
         self.assertEqual(payload["tool_count"], 67)
         self.assertEqual(payload["raw_tool_count"], 67)

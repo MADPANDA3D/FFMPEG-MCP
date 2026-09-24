@@ -95,6 +95,7 @@ from reel_library import (
     update_clip,
     validate_reel_plan,
 )
+from reel_render import reel_render_job
 from templates import describe_template, list_templates
 from task_queue import get_queue
 from tool_manifest import (
@@ -3567,13 +3568,37 @@ async def tool_madpanda_reel_render(
     validation = validate_reel_plan(plan)
     if not validation["ok"]:
         raise ValueError("invalid MADPANDA3D Reel plan: " + "; ".join(validation["errors"]))
-    workflow = plan.get("workflow")
-    if not isinstance(workflow, dict):
-        raise ValueError("plan.workflow must contain the bounded existing workflow graph")
     if dry_run:
-        return {"dry_run": True, "validation": validation, "workflow": workflow}
-    result = await tool_workflow_run(workflow, priority)
-    return {**result, "dry_run": False, "input_fingerprint": validation["input_fingerprint"]}
+        return {
+            "dry_run": True,
+            "validation": validation,
+            "render_plan": {
+                "template_id": plan["template_id"],
+                "template_version": plan.get("template_version"),
+                "duration_sec": plan["duration_sec"],
+                "shot_count": len(plan["shots"]),
+                "outro_duration_sec": plan.get("outro_duration_sec", 5.5),
+                "overlay_count": len(plan.get("overlays") or []),
+                "quality": plan.get("quality", "high"),
+            },
+        }
+    job_id = _enqueue_job(
+        "madpanda_reel_render",
+        reel_render_job,
+        (
+            plan["shots"][0]["clip_id"],
+            plan,
+            validation["input_fingerprint"],
+        ),
+        priority=priority,
+        job_timeout=settings.workflow_timeout_seconds(),
+    )
+    return {
+        "job_id": job_id,
+        "cache_hit": False,
+        "dry_run": False,
+        "input_fingerprint": validation["input_fingerprint"],
+    }
 
 
 TOOL_REGISTRY: dict[str, Callable[..., Awaitable[dict]]] = {

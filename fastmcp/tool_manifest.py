@@ -19,7 +19,7 @@ from typing import Any, get_args, get_origin, get_type_hints
 
 SCHEMA_VERSION = "1.0.0"
 SERVICE_ID = "ffmpeg"
-CATALOG_VERSION = "2026-09-23.1"
+CATALOG_VERSION = "2026-09-23.2"
 DOCUMENTATION_URL = "https://github.com/MADPANDA3D/FFMPEG-MCP"
 
 
@@ -281,7 +281,7 @@ TOOL_DESCRIPTIONS: dict[str, str] = {
     "template_version_list": ("List the latest records for all versioned agent-authored render templates so agents can select approved production contracts safely."),
     "madpanda_reel_contract": ("Return the approved MADPANDA3D 1080x1920 Reel canvas, shaped audio chain, 5.5-second versioned outro, codec, loudness, and 30-45 second delivery constraints."),
     "madpanda_reel_validate": ("Validate and fingerprint an ordered MADPANDA3D Reel assembly plan before rendering, including required narration, music, outro, shots, trims, and 30-45 second duration."),
-    "madpanda_reel_render": ("Dry-run or queue an approved MADPANDA3D 30-45 second vertical Reel through the existing bounded workflow engine after validating clips, narration, music, outro, and delivery constraints."),
+    "madpanda_reel_render": ("Dry-run or queue the approved MADPANDA3D 30-45 second vertical Reel pipeline. The bounded renderer assembles ordered clips and a versioned 5.5-second outro, applies the approved narration/music chain, produces a contact sheet, verifies decode and delivery metadata, preserves input hashes, and returns signed master and preview URLs through job_status."),
 }
 
 
@@ -949,8 +949,8 @@ def _output_schema(name: str) -> dict[str, Any]:
         properties = {
             "dry_run": _property("boolean", "Whether processing was planned only."),
             "validation": _object_property("Validated Reel plan result for dry runs."),
-            "workflow": _object_property("Bounded workflow graph for dry runs."),
-            "job_id": _property("string", "Queued workflow job ID for live renders."),
+            "render_plan": _object_property("Bounded render summary for dry runs."),
+            "job_id": _property("string", "Queued Reel render and QA job ID."),
             "cache_hit": _property(
                 "boolean", "Whether an identical completed render was reused."
             ),
